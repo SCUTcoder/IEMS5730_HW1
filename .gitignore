@@ -85,3 +85,8 @@ readme.md
 README_*.md
 QUICK_START.md
 LocalTest.java
+target/
+output/
+*.tar.gz
+data/
+*.pdf   

@@ -63,6 +63,13 @@ public class TaskA {
     // ========== Job 2: Find Common Suppliers Between All Company Pairs ==========
     
     public static class CommonSupplierMapper extends Mapper<Object, Text, Text, Text> {
+        private int numReducers = 32; // Will be set from job config
+        
+        @Override
+        protected void setup(Context context) {
+            numReducers = context.getNumReduceTasks();
+        }
+        
         @Override
         public void map(Object key, Text value, Context context) 
                 throws IOException, InterruptedException {
@@ -74,8 +81,12 @@ public class TaskA {
                 String company = parts[0];
                 String supplierList = parts[1];
                 
-                // Emit company ID and supplier list for pairing
-                context.write(new Text("ALL"), new Text(company + ":" + supplierList));
+                // Send this company to ALL reducer partitions
+                // Each partition will compare companies it receives
+                for (int i = 0; i < numReducers; i++) {
+                    context.write(new Text(String.valueOf(i)), 
+                                 new Text(company + ":" + supplierList));
+                }
             }
         }
     }
@@ -85,7 +96,7 @@ public class TaskA {
         public void reduce(Text key, Iterable<Text> values, Context context) 
                 throws IOException, InterruptedException {
             
-            // Collect all companies and their supplier lists
+            // Collect all companies in this partition
             List<CompanySuppliers> companies = new ArrayList<>();
             for (Text val : values) {
                 String[] parts = val.toString().split(":", 2);
@@ -96,27 +107,39 @@ public class TaskA {
                 }
             }
             
-            // Find common suppliers for all pairs
+            int partitionId = Integer.parseInt(key.toString());
+            int totalPartitions = context.getNumReduceTasks();
+            
+            // Compare all pairs in this partition
+            // Use partition ID to distribute work evenly
             for (int i = 0; i < companies.size(); i++) {
                 for (int j = i + 1; j < companies.size(); j++) {
                     CompanySuppliers c1 = companies.get(i);
                     CompanySuppliers c2 = companies.get(j);
                     
-                    Set<String> common = new HashSet<>(c1.suppliers);
-                    common.retainAll(c2.suppliers);
+                    // Determine which partition should handle this pair
+                    // Use hash of sorted company IDs
+                    String pairKey = c1.companyId.compareTo(c2.companyId) < 0
+                        ? c1.companyId + ":" + c2.companyId
+                        : c2.companyId + ":" + c1.companyId;
+                    int assignedPartition = Math.abs(pairKey.hashCode()) % totalPartitions;
                     
-                    if (!common.isEmpty()) {
-                        List<String> commonList = new ArrayList<>(common);
-                        Collections.sort(commonList);
-                        String commonStr = "{" + String.join(",", commonList) + "}";
+                    // Only process if this partition is responsible
+                    if (assignedPartition == partitionId) {
+                        Set<String> common = new HashSet<>(c1.suppliers);
+                        common.retainAll(c2.suppliers);
                         
-                        // Output for company 1
-                        context.write(new Text(c1.companyId), 
-                                     new Text(c2.companyId + "," + commonStr + "," + common.size()));
-                        
-                        // Output for company 2
-                        context.write(new Text(c2.companyId), 
-                                     new Text(c1.companyId + "," + commonStr + "," + common.size()));
+                        if (!common.isEmpty()) {
+                            List<String> commonList = new ArrayList<>(common);
+                            Collections.sort(commonList);
+                            String commonStr = "{" + String.join(",", commonList) + "}";
+                            
+                            // Output for both companies
+                            context.write(new Text(c1.companyId), 
+                                         new Text(c2.companyId + "," + commonStr + "," + common.size()));
+                            context.write(new Text(c2.companyId), 
+                                         new Text(c1.companyId + "," + commonStr + "," + common.size()));
+                        }
                     }
                 }
             }
@@ -201,6 +224,7 @@ public class TaskA {
         job1.setReducerClass(SupplierListReducer.class);
         job1.setOutputKeyClass(Text.class);
         job1.setOutputValueClass(Text.class);
+        job1.setNumReduceTasks(8);
         
         FileInputFormat.addInputPath(job1, new Path(args[0]));
         Path job1Output = new Path(args[1] + "_job1");
@@ -217,7 +241,7 @@ public class TaskA {
         job2.setReducerClass(CommonSupplierReducer.class);
         job2.setOutputKeyClass(Text.class);
         job2.setOutputValueClass(Text.class);
-        job2.setNumReduceTasks(1); // Single reducer to compare all pairs
+        job2.setNumReduceTasks(32); // Multiple reducers to distribute pair comparison
         
         FileInputFormat.addInputPath(job2, job1Output);
         Path job2Output = new Path(args[1] + "_job2");
@@ -234,6 +258,7 @@ public class TaskA {
         job3.setReducerClass(MaxCommonReducer.class);
         job3.setOutputKeyClass(Text.class);
         job3.setOutputValueClass(Text.class);
+        job3.setNumReduceTasks(8); // Multiple reducers for parallel processing
         
         FileInputFormat.addInputPath(job3, job2Output);
         FileOutputFormat.setOutputPath(job3, new Path(args[1]));

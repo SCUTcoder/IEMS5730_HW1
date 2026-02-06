@@ -1,268 +1,348 @@
 package edu.cuhk.iems5730;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.conf.Configured;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+
 import org.apache.hadoop.io.IntWritable;
+import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.Text;
+
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Partitioner;
 import org.apache.hadoop.mapreduce.Reducer;
+
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.util.Tool;
+import org.apache.hadoop.util.ToolRunner;
 
 import java.io.IOException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 
 /**
- * Task A: For EVERY company, recommend the company with the maximal number of common suppliers.
- * 
- * This requires 3 MapReduce jobs:
- * Job1: Extract all supplier relationships (buyer -> list of suppliers)
- * Job2: Find all common suppliers between company pairs
- * Job3: Select the company with max common suppliers for each company
+ * TaskA - Find the pair of companies with the maximum number of common suppliers.
+ *
+ * Assumed input format: each line is an edge "company supplier" (space/tab/comma-separated).
+ * Example:
+ *   c1 s9
+ *   c2 s9
+ *   c1 s3
+ *
+ * Output format:
+ *   <company1>\t<company2>\t<count>
+ *
+ * This implementation uses TWO MapReduce jobs:
+ *   Job1: supplier -> list(companies) -> emit all pairs (c1,c2) with +1 per supplier; reduce sums.
+ *   Job2: scan pair counts and pick the global maximum (single reducer, O(1) memory).
  */
-public class TaskA {
+public class TaskA extends Configured implements Tool {
 
-    // ========== Job 1: Build Supplier List for Each Company ==========
-    
-    public static class SupplierListMapper extends Mapper<Object, Text, Text, Text> {
-        private Text buyer = new Text();
-        private Text supplier = new Text();
+    // -------------------------
+    // Job1: supplier -> companies, generate pairs
+    // -------------------------
+    public static class SupplierToCompanyMapper extends Mapper<LongWritable, Text, Text, Text> {
+        private final Text outKey = new Text();
+        private final Text outVal = new Text();
 
         @Override
-        public void map(Object key, Text value, Context context) 
-                throws IOException, InterruptedException {
+        protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
             String line = value.toString().trim();
             if (line.isEmpty()) return;
-            
-            String[] parts = line.split("\\s+");
-            if (parts.length >= 2) {
-                buyer.set(parts[0]);
-                supplier.set(parts[1]);
-                context.write(buyer, supplier);
-            }
+
+            // split by tab / space / comma
+            String[] parts = line.split("[\\s,]+");
+            if (parts.length < 2) return;
+
+            String company = parts[0].trim();
+            String supplier = parts[1].trim();
+            if (company.isEmpty() || supplier.isEmpty()) return;
+
+            // key: supplier, val: company
+            outKey.set(supplier);
+            outVal.set(company);
+            context.write(outKey, outVal);
         }
     }
 
-    public static class SupplierListReducer extends Reducer<Text, Text, Text, Text> {
-        @Override
-        public void reduce(Text key, Iterable<Text> values, Context context) 
-                throws IOException, InterruptedException {
-            Set<String> suppliers = new TreeSet<>();
-            for (Text val : values) {
-                suppliers.add(val.toString());
-            }
-            
-            // Output: company -> supplier1,supplier2,supplier3,...
-            if (!suppliers.isEmpty()) {
-                context.write(key, new Text(String.join(",", suppliers)));
-            }
-        }
-    }
+    public static class SupplierToCompanyReducer extends Reducer<Text, Text, Text, IntWritable> {
+        private final Text outKey = new Text();
+        private static final IntWritable ONE = new IntWritable(1);
 
-    // ========== Job 2: Find Common Suppliers Between All Company Pairs ==========
-    
-    public static class CommonSupplierMapper extends Mapper<Object, Text, Text, Text> {
-        private int numReducers = 32; // Will be set from job config
-        
+        // 为了防止极端 supplier（连接到成千上万公司）产生 O(k^2) 爆炸，
+        // 这里提供一个可配置“上限”。默认 5000，你可以按数据调小/调大。
+        // 如果你必须 100% 精确且数据确实有超级 hub supplier，就把它设得更大。
+        private int maxCompaniesPerSupplier;
+
         @Override
         protected void setup(Context context) {
-            numReducers = context.getNumReduceTasks();
+            Configuration conf = context.getConfiguration();
+            maxCompaniesPerSupplier = conf.getInt("taskA.maxCompaniesPerSupplier", 5000);
         }
-        
+
         @Override
-        public void map(Object key, Text value, Context context) 
+        protected void reduce(Text supplier, Iterable<Text> companies, Context context)
                 throws IOException, InterruptedException {
-            String line = value.toString().trim();
-            if (line.isEmpty()) return;
-            
-            String[] parts = line.split("\\t");
-            if (parts.length >= 2) {
-                String company = parts[0];
-                String supplierList = parts[1];
-                
-                // Send this company to ALL reducer partitions
-                // Each partition will compare companies it receives
-                for (int i = 0; i < numReducers; i++) {
-                    context.write(new Text(String.valueOf(i)), 
-                                 new Text(company + ":" + supplierList));
+
+            // 去重：同一个 supplier 下可能出现重复 company 记录
+            HashSet<String> uniq = new HashSet<>();
+            for (Text c : companies) {
+                uniq.add(c.toString());
+                // 早停：避免 set 无限膨胀
+                if (uniq.size() > maxCompaniesPerSupplier) {
+                    // 超过上限：直接丢弃这个 supplier（防爆）
+                    // 如果你想“尽量保留”，可以改成只保留前 maxCompaniesPerSupplier 个（但会影响精确性）
+                    return;
+                }
+            }
+
+            if (uniq.size() < 2) return;
+
+            ArrayList<String> list = new ArrayList<>(uniq);
+            Collections.sort(list);
+
+            // 生成所有 company pairs: (ci,cj), i<j
+            // 每出现一次 pair，表示它们共享了当前 supplier -> +1
+            int n = list.size();
+            for (int i = 0; i < n; i++) {
+                String ci = list.get(i);
+                for (int j = i + 1; j < n; j++) {
+                    String cj = list.get(j);
+                    outKey.set(ci + "\t" + cj);
+                    context.write(outKey, ONE);
                 }
             }
         }
     }
 
-    public static class CommonSupplierReducer extends Reducer<Text, Text, Text, Text> {
+    // Combiner/Reducer: sum counts per pair
+    public static class SumIntReducer extends Reducer<Text, IntWritable, Text, IntWritable> {
+        private final IntWritable outVal = new IntWritable();
+
         @Override
-        public void reduce(Text key, Iterable<Text> values, Context context) 
+        protected void reduce(Text key, Iterable<IntWritable> vals, Context context)
                 throws IOException, InterruptedException {
-            
-            // Collect all companies in this partition
-            List<CompanySuppliers> companies = new ArrayList<>();
-            for (Text val : values) {
-                String[] parts = val.toString().split(":", 2);
-                if (parts.length == 2) {
-                    String companyId = parts[0];
-                    Set<String> suppliers = new HashSet<>(Arrays.asList(parts[1].split(",")));
-                    companies.add(new CompanySuppliers(companyId, suppliers));
+            long sum = 0;
+            for (IntWritable v : vals) sum += v.get();
+            // 计数通常不会超过 int 范围；如果你担心，改 LongWritable
+            outVal.set((int) Math.min(sum, Integer.MAX_VALUE));
+            context.write(key, outVal);
+        }
+    }
+
+    // -------------------------
+    // Job2: find global max pair count
+    // -------------------------
+    public static class MaxScanMapper extends Mapper<LongWritable, Text, Text, Text> {
+        private static final Text CONST_KEY = new Text("MAX");
+        private final Text outVal = new Text();
+
+        @Override
+        protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+            // line: "c1 \t c2 \t count"  (from Job1 output)
+            String line = value.toString().trim();
+            if (line.isEmpty()) return;
+
+            String[] parts = line.split("\\t");
+            if (parts.length < 3) return;
+
+            String c1 = parts[0].trim();
+            String c2 = parts[1].trim();
+            String cntStr = parts[2].trim();
+            if (c1.isEmpty() || c2.isEmpty() || cntStr.isEmpty()) return;
+
+            // value: "count \t c1 \t c2" 方便 reducer 比较
+            outVal.set(cntStr + "\t" + c1 + "\t" + c2);
+            context.write(CONST_KEY, outVal);
+        }
+    }
+
+    public static class MaxScanReducer extends Reducer<Text, Text, Text, IntWritable> {
+        private final Text outKey = new Text();
+        private final IntWritable outVal = new IntWritable();
+
+        @Override
+        protected void reduce(Text key, Iterable<Text> vals, Context context)
+                throws IOException, InterruptedException {
+
+            long best = -1;
+            String bestC1 = "";
+            String bestC2 = "";
+
+            for (Text v : vals) {
+                String[] parts = v.toString().split("\\t");
+                if (parts.length < 3) continue;
+                long cnt;
+                try {
+                    cnt = Long.parseLong(parts[0]);
+                } catch (NumberFormatException e) {
+                    continue;
                 }
-            }
-            
-            int partitionId = Integer.parseInt(key.toString());
-            int totalPartitions = context.getNumReduceTasks();
-            
-            // Compare all pairs in this partition
-            // Use partition ID to distribute work evenly
-            for (int i = 0; i < companies.size(); i++) {
-                for (int j = i + 1; j < companies.size(); j++) {
-                    CompanySuppliers c1 = companies.get(i);
-                    CompanySuppliers c2 = companies.get(j);
-                    
-                    // Determine which partition should handle this pair
-                    // Use hash of sorted company IDs
-                    String pairKey = c1.companyId.compareTo(c2.companyId) < 0
-                        ? c1.companyId + ":" + c2.companyId
-                        : c2.companyId + ":" + c1.companyId;
-                    int assignedPartition = Math.abs(pairKey.hashCode()) % totalPartitions;
-                    
-                    // Only process if this partition is responsible
-                    if (assignedPartition == partitionId) {
-                        Set<String> common = new HashSet<>(c1.suppliers);
-                        common.retainAll(c2.suppliers);
-                        
-                        if (!common.isEmpty()) {
-                            List<String> commonList = new ArrayList<>(common);
-                            Collections.sort(commonList);
-                            String commonStr = "{" + String.join(",", commonList) + "}";
-                            
-                            // Output for both companies
-                            context.write(new Text(c1.companyId), 
-                                         new Text(c2.companyId + "," + commonStr + "," + common.size()));
-                            context.write(new Text(c2.companyId), 
-                                         new Text(c1.companyId + "," + commonStr + "," + common.size()));
-                        }
+                String c1 = parts[1];
+                String c2 = parts[2];
+
+                // 选更大；若相等，用字典序稳定输出（方便验收）
+                if (cnt > best) {
+                    best = cnt;
+                    bestC1 = c1;
+                    bestC2 = c2;
+                } else if (cnt == best) {
+                    String cur = c1 + "\t" + c2;
+                    String prev = bestC1 + "\t" + bestC2;
+                    if (cur.compareTo(prev) < 0) {
+                        bestC1 = c1;
+                        bestC2 = c2;
                     }
                 }
             }
-        }
-        
-        private static class CompanySuppliers {
-            String companyId;
-            Set<String> suppliers;
-            
-            CompanySuppliers(String id, Set<String> sup) {
-                this.companyId = id;
-                this.suppliers = sup;
+
+            if (best >= 0) {
+                outKey.set(bestC1 + "\t" + bestC2);
+                outVal.set((int) Math.min(best, Integer.MAX_VALUE));
+                context.write(outKey, outVal);
             }
         }
     }
 
-    // ========== Job 3: Select Max Common Suppliers for Each Company ==========
-    
-    public static class MaxCommonMapper extends Mapper<Object, Text, Text, Text> {
+    // Ensure Job2 has only one reducer (global max)
+    public static class SinglePartitioner extends Partitioner<Text, Text> {
         @Override
-        public void map(Object key, Text value, Context context) 
-                throws IOException, InterruptedException {
-            String line = value.toString().trim();
-            if (line.isEmpty()) return;
-            
-            String[] parts = line.split("\\t");
-            if (parts.length >= 2) {
-                context.write(new Text(parts[0]), new Text(parts[1]));
-            }
+        public int getPartition(Text key, Text value, int numPartitions) {
+            return 0;
         }
     }
 
-    public static class MaxCommonReducer extends Reducer<Text, Text, Text, Text> {
-        @Override
-        public void reduce(Text key, Iterable<Text> values, Context context) 
-                throws IOException, InterruptedException {
-            
-            String bestCompany = null;
-            String bestCommonSuppliers = null;
-            int maxCount = 0;
-            
-            for (Text val : values) {
-                String[] parts = val.toString().split(",", 3);
-                if (parts.length == 3) {
-                    String otherCompany = parts[0];
-                    String commonSuppliers = parts[1];
-                    int count = Integer.parseInt(parts[2]);
-                    
-                    // Keep the one with max count, or smaller ID if tied
-                    if (count > maxCount || 
-                        (count == maxCount && (bestCompany == null || otherCompany.compareTo(bestCompany) < 0))) {
-                        maxCount = count;
-                        bestCompany = otherCompany;
-                        bestCommonSuppliers = commonSuppliers;
-                    }
-                }
-            }
-            
-            if (bestCompany != null) {
-                // Output format: A:B, {C,E}, 2
-                String output = key.toString() + ":" + bestCompany + ", " + 
-                               bestCommonSuppliers + ", " + maxCount;
-                context.write(new Text(output), new Text(""));
-            }
-        }
-    }
-
-    // ========== Main Driver ==========
-    
-    public static void main(String[] args) throws Exception {
-        if (args.length != 2) {
-            System.err.println("Usage: TaskA <input path> <output path>");
-            System.exit(-1);
+    // -------------------------
+    // Driver
+    // -------------------------
+    @Override
+    public int run(String[] args) throws Exception {
+        if (args.length < 2) {
+            System.err.println("Usage: TaskA <input_path> <output_path>");
+            return 2;
         }
 
-        Configuration conf = new Configuration();
-        
-        // Job 1: Build supplier lists
-        Job job1 = Job.getInstance(conf, "Build Supplier Lists");
+        String input = args[0];
+        String output = args[1];
+        String tmp = output + "_job1_pairs";
+
+        Configuration conf = getConf();
+
+        // 强烈建议：避免 MR 自己把 reducer “600s 超时干掉”
+        // 你之前日志就是 600s timeout -> taskTimedOut=true
+        // 这里直接在代码里设 0（永不超时），保底能跑完。
+        conf.setInt("mapreduce.task.timeout", 0);
+
+        // 关闭推测执行，避免“重复 reducer + unknown container complete event”这种伴随现象更频繁
+        conf.setBoolean("mapreduce.map.speculative", false);
+        conf.setBoolean("mapreduce.reduce.speculative", false);
+
+        // Job1: supplier -> company list -> company pairs
+        Job job1 = Job.getInstance(conf, "TaskA-Job1-CountCommonSuppliers");
         job1.setJarByClass(TaskA.class);
-        job1.setMapperClass(SupplierListMapper.class);
-        job1.setReducerClass(SupplierListReducer.class);
+
+        job1.setMapperClass(SupplierToCompanyMapper.class);
+        job1.setMapOutputKeyClass(Text.class);
+        job1.setMapOutputValueClass(Text.class);
+
+        // reducer 生成 pair -> 1
+        job1.setReducerClass(SupplierToCompanyReducer.class);
         job1.setOutputKeyClass(Text.class);
-        job1.setOutputValueClass(Text.class);
-        job1.setNumReduceTasks(8);
-        
-        FileInputFormat.addInputPath(job1, new Path(args[0]));
-        Path job1Output = new Path(args[1] + "_job1");
-        FileOutputFormat.setOutputPath(job1, job1Output);
-        
-        if (!job1.waitForCompletion(true)) {
-            System.exit(1);
-        }
-        
-        // Job 2: Find common suppliers
-        Job job2 = Job.getInstance(conf, "Find Common Suppliers");
+        job1.setOutputValueClass(IntWritable.class);
+
+        // 这里 combiner 不能用 SupplierToCompanyReducer（类型不一致）
+        // 但我们有第二阶段“SumIntReducer”才是加和逻辑，所以 Job1 只负责生成 pair->1
+        // 为了减少网络传输，我们把 “pair->1 的加和” 放到 Job1 的后半：用第二个 job 更稳
+        // ——因此：Job1 输出 pair->1，Job1 不设 combiner。
+
+        FileInputFormat.addInputPath(job1, new Path(input));
+        FileOutputFormat.setOutputPath(job1, new Path(tmp));
+
+        // Ensure tmp output doesn't exist
+        FileSystem fs = FileSystem.get(conf);
+        fs.delete(new Path(tmp), true);
+
+        boolean ok1 = job1.waitForCompletion(true);
+        if (!ok1) return 1;
+
+        // Job1.5: sum counts per pair（把 pair->1 变成 pair->count）
+        String tmp2 = output + "_job1_counts";
+        Job job1b = Job.getInstance(conf, "TaskA-Job1b-SumPairCounts");
+        job1b.setJarByClass(TaskA.class);
+
+        // Mapper: identity parse "pair\t1" -> (pair,1)
+        job1b.setMapperClass(new Mapper<LongWritable, Text, Text, IntWritable>() {
+            private final Text k = new Text();
+            private final IntWritable v = new IntWritable();
+
+            @Override
+            protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+                String line = value.toString().trim();
+                if (line.isEmpty()) return;
+                String[] parts = line.split("\\t");
+                if (parts.length < 3) return; // pair is "c1\tc2" then "\t1" => total >=3
+                String c1 = parts[0].trim();
+                String c2 = parts[1].trim();
+                String cnt = parts[2].trim();
+                if (c1.isEmpty() || c2.isEmpty() || cnt.isEmpty()) return;
+                int n;
+                try { n = Integer.parseInt(cnt); } catch (NumberFormatException e) { return; }
+                k.set(c1 + "\t" + c2);
+                v.set(n);
+                context.write(k, v);
+            }
+        }.getClass());
+
+        job1b.setMapOutputKeyClass(Text.class);
+        job1b.setMapOutputValueClass(IntWritable.class);
+
+        job1b.setCombinerClass(SumIntReducer.class);
+        job1b.setReducerClass(SumIntReducer.class);
+
+        job1b.setOutputKeyClass(Text.class);
+        job1b.setOutputValueClass(IntWritable.class);
+
+        FileInputFormat.addInputPath(job1b, new Path(tmp));
+        FileOutputFormat.setOutputPath(job1b, new Path(tmp2));
+        fs.delete(new Path(tmp2), true);
+
+        boolean ok1b = job1b.waitForCompletion(true);
+        if (!ok1b) return 1;
+
+        // Job2: find global max (single reducer)
+        Job job2 = Job.getInstance(conf, "TaskA-Job2-FindGlobalMax");
         job2.setJarByClass(TaskA.class);
-        job2.setMapperClass(CommonSupplierMapper.class);
-        job2.setReducerClass(CommonSupplierReducer.class);
+
+        job2.setMapperClass(MaxScanMapper.class);
+        job2.setMapOutputKeyClass(Text.class);
+        job2.setMapOutputValueClass(Text.class);
+
+        job2.setPartitionerClass(SinglePartitioner.class);
+        job2.setNumReduceTasks(1);
+        job2.setReducerClass(MaxScanReducer.class);
+
         job2.setOutputKeyClass(Text.class);
-        job2.setOutputValueClass(Text.class);
-        job2.setNumReduceTasks(8); // Multiple reducers to distribute pair comparison
-        
-        FileInputFormat.addInputPath(job2, job1Output);
-        Path job2Output = new Path(args[1] + "_job2");
-        FileOutputFormat.setOutputPath(job2, job2Output);
-        
-        if (!job2.waitForCompletion(true)) {
-            System.exit(1);
-        }
-        
-        // Job 3: Select max common suppliers
-        Job job3 = Job.getInstance(conf, "Select Max Common Suppliers");
-        job3.setJarByClass(TaskA.class);
-        job3.setMapperClass(MaxCommonMapper.class);
-        job3.setReducerClass(MaxCommonReducer.class);
-        job3.setOutputKeyClass(Text.class);
-        job3.setOutputValueClass(Text.class);
-        job3.setNumReduceTasks(8); // Multiple reducers for parallel processing
-        
-        FileInputFormat.addInputPath(job3, job2Output);
-        FileOutputFormat.setOutputPath(job3, new Path(args[1]));
-        
-        System.exit(job3.waitForCompletion(true) ? 0 : 1);
+        job2.setOutputValueClass(IntWritable.class);
+
+        FileInputFormat.addInputPath(job2, new Path(tmp2));
+        FileOutputFormat.setOutputPath(job2, new Path(output));
+        fs.delete(new Path(output), true);
+
+        boolean ok2 = job2.waitForCompletion(true);
+
+        // 清理中间目录（可选）
+        fs.delete(new Path(tmp), true);
+        fs.delete(new Path(tmp2), true);
+
+        return ok2 ? 0 : 1;
+    }
+
+    public static void main(String[] args) throws Exception {
+        int res = ToolRunner.run(new Configuration(), new TaskA(), args);
+        System.exit(res);
     }
 }

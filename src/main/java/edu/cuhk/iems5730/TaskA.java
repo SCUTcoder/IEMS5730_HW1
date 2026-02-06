@@ -241,7 +241,7 @@ public class TaskA {
         job2.setReducerClass(CommonSupplierReducer.class);
         job2.setOutputKeyClass(Text.class);
         job2.setOutputValueClass(Text.class);
-        job2.setNumReduceTasks(32); // Multiple reducers to distribute pair comparison
+        job2.setNumReduceTasks(8); // Multiple reducers to distribute pair comparison
         
         FileInputFormat.addInputPath(job2, job1Output);
         Path job2Output = new Path(args[1] + "_job2");

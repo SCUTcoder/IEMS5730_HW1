@@ -16,6 +16,7 @@ import org.apache.hadoop.mapreduce.Reducer;
 
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
 
@@ -24,22 +25,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 
-/**
- * TaskA - Find the pair of companies with the maximum number of common suppliers.
- *
- * Assumed input format: each line is an edge "company supplier" (space/tab/comma-separated).
- * Example:
- *   c1 s9
- *   c2 s9
- *   c1 s3
- *
- * Output format:
- *   <company1>\t<company2>\t<count>
- *
- * This implementation uses TWO MapReduce jobs:
- *   Job1: supplier -> list(companies) -> emit all pairs (c1,c2) with +1 per supplier; reduce sums.
- *   Job2: scan pair counts and pick the global maximum (single reducer, O(1) memory).
- */
 public class TaskA extends Configured implements Tool {
 
     // -------------------------
@@ -62,20 +47,15 @@ public class TaskA extends Configured implements Tool {
             String supplier = parts[1].trim();
             if (company.isEmpty() || supplier.isEmpty()) return;
 
-            // key: supplier, val: company
             outKey.set(supplier);
             outVal.set(company);
             context.write(outKey, outVal);
         }
     }
 
-    public static class SupplierToCompanyReducer extends Reducer<Text, Text, Text, IntWritable> {
+    public static class SupplierToPairsReducer extends Reducer<Text, Text, Text, IntWritable> {
         private final Text outKey = new Text();
         private static final IntWritable ONE = new IntWritable(1);
-
-        // 为了防止极端 supplier（连接到成千上万公司）产生 O(k^2) 爆炸，
-        // 这里提供一个可配置“上限”。默认 5000，你可以按数据调小/调大。
-        // 如果你必须 100% 精确且数据确实有超级 hub supplier，就把它设得更大。
         private int maxCompaniesPerSupplier;
 
         @Override
@@ -88,25 +68,19 @@ public class TaskA extends Configured implements Tool {
         protected void reduce(Text supplier, Iterable<Text> companies, Context context)
                 throws IOException, InterruptedException {
 
-            // 去重：同一个 supplier 下可能出现重复 company 记录
             HashSet<String> uniq = new HashSet<>();
             for (Text c : companies) {
                 uniq.add(c.toString());
-                // 早停：避免 set 无限膨胀
                 if (uniq.size() > maxCompaniesPerSupplier) {
-                    // 超过上限：直接丢弃这个 supplier（防爆）
-                    // 如果你想“尽量保留”，可以改成只保留前 maxCompaniesPerSupplier 个（但会影响精确性）
+                    // 防止超级 supplier 产生 O(k^2) 爆炸
                     return;
                 }
             }
-
             if (uniq.size() < 2) return;
 
             ArrayList<String> list = new ArrayList<>(uniq);
             Collections.sort(list);
 
-            // 生成所有 company pairs: (ci,cj), i<j
-            // 每出现一次 pair，表示它们共享了当前 supplier -> +1
             int n = list.size();
             for (int i = 0; i < n; i++) {
                 String ci = list.get(i);
@@ -119,31 +93,16 @@ public class TaskA extends Configured implements Tool {
         }
     }
 
-    // Combiner/Reducer: sum counts per pair
-    public static class SumIntReducer extends Reducer<Text, IntWritable, Text, IntWritable> {
+    // -------------------------
+    // Job1b: parse (c1 c2 1) and sum to (c1 c2 count)
+    // -------------------------
+    public static class PairOneMapper extends Mapper<LongWritable, Text, Text, IntWritable> {
+        private final Text outKey = new Text();
         private final IntWritable outVal = new IntWritable();
 
         @Override
-        protected void reduce(Text key, Iterable<IntWritable> vals, Context context)
-                throws IOException, InterruptedException {
-            long sum = 0;
-            for (IntWritable v : vals) sum += v.get();
-            // 计数通常不会超过 int 范围；如果你担心，改 LongWritable
-            outVal.set((int) Math.min(sum, Integer.MAX_VALUE));
-            context.write(key, outVal);
-        }
-    }
-
-    // -------------------------
-    // Job2: find global max pair count
-    // -------------------------
-    public static class MaxScanMapper extends Mapper<LongWritable, Text, Text, Text> {
-        private static final Text CONST_KEY = new Text("MAX");
-        private final Text outVal = new Text();
-
-        @Override
         protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
-            // line: "c1 \t c2 \t count"  (from Job1 output)
+            // expected: c1 \t c2 \t 1
             String line = value.toString().trim();
             if (line.isEmpty()) return;
 
@@ -152,11 +111,58 @@ public class TaskA extends Configured implements Tool {
 
             String c1 = parts[0].trim();
             String c2 = parts[1].trim();
-            String cntStr = parts[2].trim();
-            if (c1.isEmpty() || c2.isEmpty() || cntStr.isEmpty()) return;
+            String one = parts[2].trim();
+            if (c1.isEmpty() || c2.isEmpty() || one.isEmpty()) return;
 
-            // value: "count \t c1 \t c2" 方便 reducer 比较
-            outVal.set(cntStr + "\t" + c1 + "\t" + c2);
+            int v;
+            try {
+                v = Integer.parseInt(one);
+            } catch (NumberFormatException e) {
+                return;
+            }
+
+            outKey.set(c1 + "\t" + c2);
+            outVal.set(v);
+            context.write(outKey, outVal);
+        }
+    }
+
+    public static class SumIntReducer extends Reducer<Text, IntWritable, Text, IntWritable> {
+        private final IntWritable outVal = new IntWritable();
+
+        @Override
+        protected void reduce(Text key, Iterable<IntWritable> vals, Context context)
+                throws IOException, InterruptedException {
+            long sum = 0;
+            for (IntWritable v : vals) sum += v.get();
+            outVal.set((int) Math.min(sum, Integer.MAX_VALUE));
+            context.write(key, outVal);
+        }
+    }
+
+    // -------------------------
+    // Job2: find global max
+    // -------------------------
+    public static class MaxScanMapper extends Mapper<LongWritable, Text, Text, Text> {
+        private static final Text CONST_KEY = new Text("MAX");
+        private final Text outVal = new Text();
+
+        @Override
+        protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+            // expected: c1 \t c2 \t count
+            String line = value.toString().trim();
+            if (line.isEmpty()) return;
+
+            String[] parts = line.split("\\t");
+            if (parts.length < 3) return;
+
+            String c1 = parts[0].trim();
+            String c2 = parts[1].trim();
+            String cnt = parts[2].trim();
+            if (c1.isEmpty() || c2.isEmpty() || cnt.isEmpty()) return;
+
+            // store as: count \t c1 \t c2
+            outVal.set(cnt + "\t" + c1 + "\t" + c2);
             context.write(CONST_KEY, outVal);
         }
     }
@@ -168,7 +174,6 @@ public class TaskA extends Configured implements Tool {
         @Override
         protected void reduce(Text key, Iterable<Text> vals, Context context)
                 throws IOException, InterruptedException {
-
             long best = -1;
             String bestC1 = "";
             String bestC2 = "";
@@ -176,16 +181,17 @@ public class TaskA extends Configured implements Tool {
             for (Text v : vals) {
                 String[] parts = v.toString().split("\\t");
                 if (parts.length < 3) continue;
+
                 long cnt;
                 try {
                     cnt = Long.parseLong(parts[0]);
                 } catch (NumberFormatException e) {
                     continue;
                 }
+
                 String c1 = parts[1];
                 String c2 = parts[2];
 
-                // 选更大；若相等，用字典序稳定输出（方便验收）
                 if (cnt > best) {
                     best = cnt;
                     bestC1 = c1;
@@ -208,7 +214,6 @@ public class TaskA extends Configured implements Tool {
         }
     }
 
-    // Ensure Job2 has only one reducer (global max)
     public static class SinglePartitioner extends Partitioner<Text, Text> {
         @Override
         public int getPartition(Text key, Text value, int numPartitions) {
@@ -228,75 +233,43 @@ public class TaskA extends Configured implements Tool {
 
         String input = args[0];
         String output = args[1];
-        String tmp = output + "_job1_pairs";
+        String tmp1 = output + "_job1_pairs";
+        String tmp2 = output + "_job1_counts";
 
         Configuration conf = getConf();
 
-        // 强烈建议：避免 MR 自己把 reducer “600s 超时干掉”
-        // 你之前日志就是 600s timeout -> taskTimedOut=true
-        // 这里直接在代码里设 0（永不超时），保底能跑完。
+        // fix your previous symptom: reducer task timeout at 600s
         conf.setInt("mapreduce.task.timeout", 0);
-
-        // 关闭推测执行，避免“重复 reducer + unknown container complete event”这种伴随现象更频繁
         conf.setBoolean("mapreduce.map.speculative", false);
         conf.setBoolean("mapreduce.reduce.speculative", false);
 
-        // Job1: supplier -> company list -> company pairs
-        Job job1 = Job.getInstance(conf, "TaskA-Job1-CountCommonSuppliers");
+        FileSystem fs = FileSystem.get(conf);
+        fs.delete(new Path(tmp1), true);
+        fs.delete(new Path(tmp2), true);
+        fs.delete(new Path(output), true);
+
+        // Job1
+        Job job1 = Job.getInstance(conf, "TaskA-Job1-GeneratePairs");
         job1.setJarByClass(TaskA.class);
 
         job1.setMapperClass(SupplierToCompanyMapper.class);
         job1.setMapOutputKeyClass(Text.class);
         job1.setMapOutputValueClass(Text.class);
 
-        // reducer 生成 pair -> 1
-        job1.setReducerClass(SupplierToCompanyReducer.class);
+        job1.setReducerClass(SupplierToPairsReducer.class);
         job1.setOutputKeyClass(Text.class);
         job1.setOutputValueClass(IntWritable.class);
 
-        // 这里 combiner 不能用 SupplierToCompanyReducer（类型不一致）
-        // 但我们有第二阶段“SumIntReducer”才是加和逻辑，所以 Job1 只负责生成 pair->1
-        // 为了减少网络传输，我们把 “pair->1 的加和” 放到 Job1 的后半：用第二个 job 更稳
-        // ——因此：Job1 输出 pair->1，Job1 不设 combiner。
-
         FileInputFormat.addInputPath(job1, new Path(input));
-        FileOutputFormat.setOutputPath(job1, new Path(tmp));
+        FileOutputFormat.setOutputPath(job1, new Path(tmp1));
 
-        // Ensure tmp output doesn't exist
-        FileSystem fs = FileSystem.get(conf);
-        fs.delete(new Path(tmp), true);
+        if (!job1.waitForCompletion(true)) return 1;
 
-        boolean ok1 = job1.waitForCompletion(true);
-        if (!ok1) return 1;
-
-        // Job1.5: sum counts per pair（把 pair->1 变成 pair->count）
-        String tmp2 = output + "_job1_counts";
+        // Job1b (sum)
         Job job1b = Job.getInstance(conf, "TaskA-Job1b-SumPairCounts");
         job1b.setJarByClass(TaskA.class);
 
-        // Mapper: identity parse "pair\t1" -> (pair,1)
-        job1b.setMapperClass(new Mapper<LongWritable, Text, Text, IntWritable>() {
-            private final Text k = new Text();
-            private final IntWritable v = new IntWritable();
-
-            @Override
-            protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
-                String line = value.toString().trim();
-                if (line.isEmpty()) return;
-                String[] parts = line.split("\\t");
-                if (parts.length < 3) return; // pair is "c1\tc2" then "\t1" => total >=3
-                String c1 = parts[0].trim();
-                String c2 = parts[1].trim();
-                String cnt = parts[2].trim();
-                if (c1.isEmpty() || c2.isEmpty() || cnt.isEmpty()) return;
-                int n;
-                try { n = Integer.parseInt(cnt); } catch (NumberFormatException e) { return; }
-                k.set(c1 + "\t" + c2);
-                v.set(n);
-                context.write(k, v);
-            }
-        }.getClass());
-
+        job1b.setMapperClass(PairOneMapper.class);
         job1b.setMapOutputKeyClass(Text.class);
         job1b.setMapOutputValueClass(IntWritable.class);
 
@@ -306,14 +279,12 @@ public class TaskA extends Configured implements Tool {
         job1b.setOutputKeyClass(Text.class);
         job1b.setOutputValueClass(IntWritable.class);
 
-        FileInputFormat.addInputPath(job1b, new Path(tmp));
+        FileInputFormat.addInputPath(job1b, new Path(tmp1));
         FileOutputFormat.setOutputPath(job1b, new Path(tmp2));
-        fs.delete(new Path(tmp2), true);
 
-        boolean ok1b = job1b.waitForCompletion(true);
-        if (!ok1b) return 1;
+        if (!job1b.waitForCompletion(true)) return 1;
 
-        // Job2: find global max (single reducer)
+        // Job2 (global max)
         Job job2 = Job.getInstance(conf, "TaskA-Job2-FindGlobalMax");
         job2.setJarByClass(TaskA.class);
 
@@ -323,22 +294,21 @@ public class TaskA extends Configured implements Tool {
 
         job2.setPartitionerClass(SinglePartitioner.class);
         job2.setNumReduceTasks(1);
-        job2.setReducerClass(MaxScanReducer.class);
 
+        job2.setReducerClass(MaxScanReducer.class);
         job2.setOutputKeyClass(Text.class);
         job2.setOutputValueClass(IntWritable.class);
 
         FileInputFormat.addInputPath(job2, new Path(tmp2));
         FileOutputFormat.setOutputPath(job2, new Path(output));
-        fs.delete(new Path(output), true);
 
-        boolean ok2 = job2.waitForCompletion(true);
+        boolean ok = job2.waitForCompletion(true);
 
-        // 清理中间目录（可选）
-        fs.delete(new Path(tmp), true);
+        // cleanup temp
+        fs.delete(new Path(tmp1), true);
         fs.delete(new Path(tmp2), true);
 
-        return ok2 ? 0 : 1;
+        return ok ? 0 : 1;
     }
 
     public static void main(String[] args) throws Exception {

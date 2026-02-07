@@ -3,283 +3,411 @@ package edu.cuhk.iems5730;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.IntWritable;
+import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.Job;
 import org.apache.hadoop.mapreduce.Mapper;
+import org.apache.hadoop.mapreduce.Partitioner;
 import org.apache.hadoop.mapreduce.Reducer;
 import org.apache.hadoop.mapreduce.lib.input.MultipleInputs;
 import org.apache.hadoop.mapreduce.lib.input.TextInputFormat;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 
 import java.io.IOException;
-import java.util.*;
 
 /**
- * Task C: For each community in the medium dataset, figure out how many (unique) members
- * act as the common suppliers of other companies.
- * 
- * This requires 3 MapReduce jobs:
- * Job1: Find all common suppliers across all company pairs
- * Job2: Join with labels to get community information
- * Job3: Count unique members per community
+ * Task C (Skew-safe):
+ * For each community, count how many unique members are "common suppliers" of other companies.
+ *
+ * Common supplier definition (equivalent, scalable):
+ * A company s is a common supplier if it supplies to >= 2 different buyers.
+ *
+ * Jobs:
+ * Job1: Salted pre-aggregation by (supplier#salt) -> emits supplier \t MULTI or supplier \t ONE:buyer
+ * Job2: Merge shards by supplier -> emits common supplier list (supplier)
+ * Job3: Join common suppliers with labels -> emits Community k \t 1
+ * Job4: Sum counts by community
  */
 public class TaskC {
 
-    // ========== Job 1: Build Supplier List ==========
-    
-    public static class SupplierListMapper extends Mapper<Object, Text, Text, Text> {
-        private Text buyer = new Text();
-        private Text supplier = new Text();
+    // Tune this for skew handling: more buckets -> more parallelism for hot suppliers
+    private static final String CONF_SALT_BUCKETS = "taskc.salt.buckets";
+    private static final int DEFAULT_SALT_BUCKETS = 64;
+
+    // =======================
+    // Job1: Salted Pre-Agg
+    // =======================
+
+    /**
+     * Input: relation file lines: buyer supplier
+     * Output key: supplier#salt
+     * Output value: buyer
+     */
+    public static class SaltedRelationMapper extends Mapper<LongWritable, Text, Text, Text> {
+        private final Text outKey = new Text();
+        private final Text outVal = new Text();
+        private int saltBuckets;
 
         @Override
-        public void map(Object key, Text value, Context context) 
-                throws IOException, InterruptedException {
+        protected void setup(Context context) {
+            saltBuckets = context.getConfiguration().getInt(CONF_SALT_BUCKETS, DEFAULT_SALT_BUCKETS);
+            if (saltBuckets <= 0) saltBuckets = DEFAULT_SALT_BUCKETS;
+        }
+
+        @Override
+        public void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
             String line = value.toString().trim();
             if (line.isEmpty()) return;
-            
+
             String[] parts = line.split("\\s+");
-            if (parts.length >= 2) {
-                buyer.set(parts[0]);
-                supplier.set(parts[1]);
-                context.write(buyer, supplier);
-            }
+            if (parts.length < 2) return;
+
+            String buyer = parts[0];
+            String supplier = parts[1];
+
+            // salt by buyer to spread hot supplier across reducers
+            int salt = (buyer.hashCode() & Integer.MAX_VALUE) % saltBuckets;
+
+            outKey.set(supplier + "#" + salt);
+            outVal.set(buyer);
+            context.write(outKey, outVal);
         }
     }
 
-    public static class SupplierListReducer extends Reducer<Text, Text, Text, Text> {
+    /**
+     * Partition by supplier only (ignore salt) OR by full key?
+     * Here we partition by full key (supplier#salt) to spread load evenly.
+     * (Default hash partitioner would also do this, but we keep it explicit.)
+     */
+    public static class FullKeyPartitioner extends Partitioner<Text, Text> {
         @Override
-        public void reduce(Text key, Iterable<Text> values, Context context) 
-                throws IOException, InterruptedException {
-            Set<String> suppliers = new TreeSet<>();
-            for (Text val : values) {
-                suppliers.add(val.toString());
-            }
-            
-            if (!suppliers.isEmpty()) {
-                context.write(key, new Text(String.join(",", suppliers)));
-            }
+        public int getPartition(Text key, Text value, int numPartitions) {
+            return (key.hashCode() & Integer.MAX_VALUE) % numPartitions;
         }
     }
 
-    // ========== Job 2: Find All Common Suppliers ==========
-    
-    public static class CommonSupplierMapper extends Mapper<Object, Text, Text, Text> {
-        @Override
-        public void map(Object key, Text value, Context context) 
-                throws IOException, InterruptedException {
-            String line = value.toString().trim();
-            if (line.isEmpty()) return;
-            
-            String[] parts = line.split("\\t");
-            if (parts.length >= 2) {
-                context.write(new Text("ALL"), new Text(parts[0] + ":" + parts[1]));
-            }
-        }
-    }
+    /**
+     * Reducer for (supplier#salt) -> buyers
+     * Emits:
+     *   supplier \t MULTI        if >=2 distinct buyers within this shard
+     *   supplier \t ONE:<buyer>  if only 1 distinct buyer within this shard
+     *
+     * NOTE: O(1) memory: we do NOT store all buyers, we stop once we find 2 unique.
+     */
+    public static class SaltedPreAggReducer extends Reducer<Text, Text, Text, Text> {
+        private final Text outKey = new Text();
+        private final Text outVal = new Text();
 
-    public static class CommonSupplierReducer extends Reducer<Text, Text, Text, Text> {
         @Override
-        public void reduce(Text key, Iterable<Text> values, Context context) 
-                throws IOException, InterruptedException {
-            
-            List<CompanySuppliers> companies = new ArrayList<>();
-            for (Text val : values) {
-                String[] parts = val.toString().split(":", 2);
-                if (parts.length == 2) {
-                    String companyId = parts[0];
-                    Set<String> suppliers = new HashSet<>(Arrays.asList(parts[1].split(",")));
-                    companies.add(new CompanySuppliers(companyId, suppliers));
+        public void reduce(Text key, Iterable<Text> values, Context context) throws IOException, InterruptedException {
+            String k = key.toString();
+            int idx = k.lastIndexOf('#');
+            if (idx <= 0) return;
+            String supplier = k.substring(0, idx);
+
+            String firstBuyer = null;
+            boolean multi = false;
+
+            for (Text v : values) {
+                String buyer = v.toString();
+                if (firstBuyer == null) {
+                    firstBuyer = buyer;
+                } else if (!firstBuyer.equals(buyer)) {
+                    multi = true;
+                    break; // early stop
                 }
             }
-            
-            // Find all common suppliers (unique)
-            Set<String> allCommonSuppliers = new HashSet<>();
-            
-            for (int i = 0; i < companies.size(); i++) {
-                for (int j = i + 1; j < companies.size(); j++) {
-                    Set<String> common = new HashSet<>(companies.get(i).suppliers);
-                    common.retainAll(companies.get(j).suppliers);
-                    allCommonSuppliers.addAll(common);
+
+            outKey.set(supplier);
+            if (multi) {
+                outVal.set("MULTI");
+            } else if (firstBuyer != null) {
+                outVal.set("ONE:" + firstBuyer);
+            } else {
+                return;
+            }
+            context.write(outKey, outVal);
+        }
+    }
+
+    // =======================
+    // Job2: Merge Shards
+    // =======================
+
+    /**
+     * Input: supplier \t MULTI  OR supplier \t ONE:buyer
+     * Output key: supplier
+     * Output value: tag
+     */
+    public static class MergeMapper extends Mapper<LongWritable, Text, Text, Text> {
+        private final Text outKey = new Text();
+        private final Text outVal = new Text();
+
+        @Override
+        public void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+            String line = value.toString().trim();
+            if (line.isEmpty()) return;
+
+            String[] parts = line.split("\\t");
+            if (parts.length < 2) return;
+
+            outKey.set(parts[0]);
+            outVal.set(parts[1]);
+            context.write(outKey, outVal);
+        }
+    }
+
+    /**
+     * Reducer:
+     * supplier is common if:
+     *   - any shard says MULTI
+     *   - OR there exist two different ONE:<buyer> across shards
+     * Output: supplier \t (empty)
+     */
+    public static class MergeReducer extends Reducer<Text, Text, Text, Text> {
+        private static final Text EMPTY = new Text("");
+
+        @Override
+        public void reduce(Text supplier, Iterable<Text> tags, Context context) throws IOException, InterruptedException {
+            boolean isCommon = false;
+            String oneBuyer = null;
+
+            for (Text t : tags) {
+                String s = t.toString();
+                if ("MULTI".equals(s)) {
+                    isCommon = true;
+                    break;
+                }
+                if (s.startsWith("ONE:")) {
+                    String buyer = s.substring(4);
+                    if (oneBuyer == null) {
+                        oneBuyer = buyer;
+                    } else if (!oneBuyer.equals(buyer)) {
+                        isCommon = true;
+                        break;
+                    }
                 }
             }
-            
-            // Output each common supplier
-            for (String supplier : allCommonSuppliers) {
-                context.write(new Text(supplier), new Text(""));
-            }
-        }
-        
-        private static class CompanySuppliers {
-            String companyId;
-            Set<String> suppliers;
-            
-            CompanySuppliers(String id, Set<String> sup) {
-                this.companyId = id;
-                this.suppliers = sup;
+
+            if (isCommon) {
+                context.write(supplier, EMPTY); // emit supplier once
             }
         }
     }
 
-    // ========== Job 3: Join with Labels and Count by Community ==========
-    
-    // Mapper for label file
-    public static class LabelMapper extends Mapper<Object, Text, Text, Text> {
+    // =======================
+    // Job3: Join with Labels
+    // =======================
+
+    // label file: companyId label
+    public static class LabelMapper extends Mapper<LongWritable, Text, Text, Text> {
+        private final Text outKey = new Text();
+        private final Text outVal = new Text();
+
         @Override
-        public void map(Object key, Text value, Context context) 
-                throws IOException, InterruptedException {
+        public void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
             String line = value.toString().trim();
             if (line.isEmpty()) return;
-            
+
             String[] parts = line.split("\\s+");
-            if (parts.length >= 2) {
-                String companyId = parts[0];
-                String label = parts[1];
-                context.write(new Text(companyId), new Text("LABEL:" + label));
-            }
+            if (parts.length < 2) return;
+
+            outKey.set(parts[0]);
+            outVal.set("LABEL:" + parts[1]);
+            context.write(outKey, outVal);
         }
     }
-    
-    // Mapper for common supplier list
-    public static class SupplierMapper extends Mapper<Object, Text, Text, Text> {
+
+    // common supplier list: supplier \t ...
+    public static class CommonSupplierMapper extends Mapper<LongWritable, Text, Text, Text> {
+        private final Text outKey = new Text();
+        private final Text outVal = new Text("CS");
+
         @Override
-        public void map(Object key, Text value, Context context) 
-                throws IOException, InterruptedException {
+        public void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
             String line = value.toString().trim();
             if (line.isEmpty()) return;
-            
+
+            // could be "supplier" or "supplier\t..."
             String[] parts = line.split("\\t");
-            if (parts.length >= 1) {
-                String supplierId = parts[0];
-                context.write(new Text(supplierId), new Text("SUPPLIER"));
-            }
+            if (parts.length < 1) return;
+
+            outKey.set(parts[0]);
+            context.write(outKey, outVal);
         }
     }
-    
+
+    /**
+     * Join reducer:
+     * If key(companyId) is both labeled and in common supplier list -> emit Community label \t 1
+     */
     public static class JoinReducer extends Reducer<Text, Text, Text, IntWritable> {
+        private static final IntWritable ONE = new IntWritable(1);
+        private final Text outKey = new Text();
+
         @Override
-        public void reduce(Text key, Iterable<Text> values, Context context) 
-                throws IOException, InterruptedException {
-            
+        public void reduce(Text companyId, Iterable<Text> values, Context context) throws IOException, InterruptedException {
             String label = null;
             boolean isCommonSupplier = false;
-            
-            for (Text val : values) {
-                String value = val.toString();
-                if (value.startsWith("LABEL:")) {
-                    label = value.substring(6);
-                } else if (value.equals("SUPPLIER")) {
+
+            for (Text v : values) {
+                String s = v.toString();
+                if (s.startsWith("LABEL:")) {
+                    label = s.substring(6);
+                } else if ("CS".equals(s)) {
                     isCommonSupplier = true;
                 }
             }
-            
-            // Only count if this company is both labeled and a common supplier
+
             if (label != null && isCommonSupplier) {
-                context.write(new Text("Community " + label), new IntWritable(1));
+                outKey.set("Community " + label);
+                context.write(outKey, ONE);
             }
         }
     }
 
-    // ========== Job 4: Count Unique Members per Community ==========
-    
-    public static class CountMapper extends Mapper<Object, Text, Text, IntWritable> {
+    // =======================
+    // Job4: Sum by Community
+    // =======================
+
+    public static class SumMapper extends Mapper<LongWritable, Text, Text, IntWritable> {
+        private final Text outKey = new Text();
+        private final IntWritable outVal = new IntWritable();
+
         @Override
-        public void map(Object key, Text value, Context context) 
-                throws IOException, InterruptedException {
+        public void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
             String line = value.toString().trim();
             if (line.isEmpty()) return;
-            
+
             String[] parts = line.split("\\t");
-            if (parts.length >= 2) {
-                context.write(new Text(parts[0]), new IntWritable(Integer.parseInt(parts[1])));
+            if (parts.length < 2) return;
+
+            outKey.set(parts[0]);
+            try {
+                outVal.set(Integer.parseInt(parts[1]));
+            } catch (NumberFormatException e) {
+                return;
             }
-        }
-    }
-    
-    public static class CountReducer extends Reducer<Text, IntWritable, Text, IntWritable> {
-        @Override
-        public void reduce(Text key, Iterable<IntWritable> values, Context context) 
-                throws IOException, InterruptedException {
-            int sum = 0;
-            for (IntWritable val : values) {
-                sum += val.get();
-            }
-            context.write(key, new IntWritable(sum));
+            context.write(outKey, outVal);
         }
     }
 
-    // ========== Main Driver ==========
-    
+    public static class SumReducer extends Reducer<Text, IntWritable, Text, IntWritable> {
+        private final IntWritable outVal = new IntWritable();
+
+        @Override
+        public void reduce(Text key, Iterable<IntWritable> values, Context context) throws IOException, InterruptedException {
+            int sum = 0;
+            for (IntWritable v : values) sum += v.get();
+            outVal.set(sum);
+            context.write(key, outVal);
+        }
+    }
+
+    // =======================
+    // Driver
+    // =======================
+
     public static void main(String[] args) throws Exception {
         if (args.length != 3) {
             System.err.println("Usage: TaskC <relation input> <label input> <output path>");
-            System.exit(-1);
+            System.exit(1);
         }
 
+        String relationInput = args[0];
+        String labelInput = args[1];
+        String outBase = args[2];
+
         Configuration conf = new Configuration();
-        
-        // Job 1: Build supplier lists
-        Job job1 = Job.getInstance(conf, "Build Supplier Lists");
+        conf.setInt(CONF_SALT_BUCKETS, DEFAULT_SALT_BUCKETS);
+
+        // ---------- Job1 ----------
+        Job job1 = Job.getInstance(conf, "TaskC-Job1-SaltedPreAgg");
         job1.setJarByClass(TaskC.class);
-        job1.setMapperClass(SupplierListMapper.class);
-        job1.setReducerClass(SupplierListReducer.class);
+
+        job1.setMapperClass(SaltedRelationMapper.class);
+        job1.setReducerClass(SaltedPreAggReducer.class);
+
+        job1.setMapOutputKeyClass(Text.class);
+        job1.setMapOutputValueClass(Text.class);
+
         job1.setOutputKeyClass(Text.class);
         job1.setOutputValueClass(Text.class);
-        
-        Path job1Input = new Path(args[0]);
-        Path job1Output = new Path(args[2] + "_job1");
-        TextInputFormat.addInputPath(job1, job1Input);
-        FileOutputFormat.setOutputPath(job1, job1Output);
-        
-        if (!job1.waitForCompletion(true)) {
-            System.exit(1);
-        }
-        
-        // Job 2: Find common suppliers
-        Job job2 = Job.getInstance(conf, "Find Common Suppliers");
+
+        // important: multiple reducers (avoid single reducer)
+        job1.setNumReduceTasks(32);
+        job1.setPartitionerClass(FullKeyPartitioner.class);
+
+        TextInputFormat.addInputPath(job1, new Path(relationInput));
+        Path job1Out = new Path(outBase + "_job1");
+        FileOutputFormat.setOutputPath(job1, job1Out);
+
+        if (!job1.waitForCompletion(true)) System.exit(1);
+
+        // ---------- Job2 ----------
+        Job job2 = Job.getInstance(conf, "TaskC-Job2-MergeShards");
         job2.setJarByClass(TaskC.class);
-        job2.setMapperClass(CommonSupplierMapper.class);
-        job2.setReducerClass(CommonSupplierReducer.class);
+
+        job2.setMapperClass(MergeMapper.class);
+        job2.setReducerClass(MergeReducer.class);
+
+        job2.setMapOutputKeyClass(Text.class);
+        job2.setMapOutputValueClass(Text.class);
+
         job2.setOutputKeyClass(Text.class);
         job2.setOutputValueClass(Text.class);
-        job2.setNumReduceTasks(1);
-        
-        Path job2Output = new Path(args[2] + "_job2");
-        TextInputFormat.addInputPath(job2, job1Output);
-        FileOutputFormat.setOutputPath(job2, job2Output);
-        
-        if (!job2.waitForCompletion(true)) {
-            System.exit(1);
-        }
-        
-        // Job 3: Join with labels
-        Job job3 = Job.getInstance(conf, "Join with Labels");
+
+        job2.setNumReduceTasks(32);
+
+        TextInputFormat.addInputPath(job2, job1Out);
+        Path job2Out = new Path(outBase + "_job2_common_suppliers");
+        FileOutputFormat.setOutputPath(job2, job2Out);
+
+        if (!job2.waitForCompletion(true)) System.exit(1);
+
+        // ---------- Job3 ----------
+        Job job3 = Job.getInstance(conf, "TaskC-Job3-JoinLabels");
         job3.setJarByClass(TaskC.class);
-        
-        MultipleInputs.addInputPath(job3, new Path(args[1]), TextInputFormat.class, LabelMapper.class);
-        MultipleInputs.addInputPath(job3, job2Output, TextInputFormat.class, SupplierMapper.class);
-        
+
+        MultipleInputs.addInputPath(job3, new Path(labelInput), TextInputFormat.class, LabelMapper.class);
+        MultipleInputs.addInputPath(job3, job2Out, TextInputFormat.class, CommonSupplierMapper.class);
+
         job3.setReducerClass(JoinReducer.class);
+
+        job3.setMapOutputKeyClass(Text.class);
+        job3.setMapOutputValueClass(Text.class);
+
         job3.setOutputKeyClass(Text.class);
         job3.setOutputValueClass(IntWritable.class);
-        
-        Path job3Output = new Path(args[2] + "_job3");
-        FileOutputFormat.setOutputPath(job3, job3Output);
-        
-        if (!job3.waitForCompletion(true)) {
-            System.exit(1);
-        }
-        
-        // Job 4: Count by community
-        Job job4 = Job.getInstance(conf, "Count by Community");
+
+        job3.setNumReduceTasks(16);
+
+        Path job3Out = new Path(outBase + "_job3_joined");
+        FileOutputFormat.setOutputPath(job3, job3Out);
+
+        if (!job3.waitForCompletion(true)) System.exit(1);
+
+        // ---------- Job4 ----------
+        Job job4 = Job.getInstance(conf, "TaskC-Job4-SumByCommunity");
         job4.setJarByClass(TaskC.class);
-        job4.setMapperClass(CountMapper.class);
-        job4.setReducerClass(CountReducer.class);
+
+        job4.setMapperClass(SumMapper.class);
+        job4.setReducerClass(SumReducer.class);
+
+        job4.setMapOutputKeyClass(Text.class);
+        job4.setMapOutputValueClass(IntWritable.class);
+
         job4.setOutputKeyClass(Text.class);
         job4.setOutputValueClass(IntWritable.class);
-        
-        TextInputFormat.addInputPath(job4, job3Output);
-        FileOutputFormat.setOutputPath(job4, new Path(args[2]));
-        
+
+        // Combiner reduces shuffle for counts
+        job4.setCombinerClass(SumReducer.class);
+        job4.setNumReduceTasks(8);
+
+        TextInputFormat.addInputPath(job4, job3Out);
+        FileOutputFormat.setOutputPath(job4, new Path(outBase));
+
         System.exit(job4.waitForCompletion(true) ? 0 : 1);
     }
 }
+

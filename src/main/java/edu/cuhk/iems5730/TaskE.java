@@ -1,358 +1,751 @@
 package edu.cuhk.iems5730;
 
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.DoubleWritable;
-import org.apache.hadoop.io.Text;
-import org.apache.hadoop.io.WritableComparable;
-import org.apache.hadoop.io.WritableComparator;
-import org.apache.hadoop.mapreduce.Job;
-import org.apache.hadoop.mapreduce.Mapper;
-import org.apache.hadoop.mapreduce.Partitioner;
-import org.apache.hadoop.mapreduce.Reducer;
-import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
-import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.fs.*;
+import org.apache.hadoop.io.*;
+import org.apache.hadoop.mapreduce.*;
+import org.apache.hadoop.mapreduce.lib.input.*;
+import org.apache.hadoop.mapreduce.lib.output.*;
+import org.apache.hadoop.util.GenericOptionsParser;
 
-import java.io.DataInput;
-import java.io.DataOutput;
-import java.io.IOException;
+import java.io.*;
+import java.net.URI;
 import java.util.*;
 
 /**
- * Task E: Find the TOP K (K=4) most similar companies for the large dataset.
- * 
- * Uses composite key and secondary sorting to handle large dataset efficiently.
- * This approach avoids memory exhaustion by using Hadoop's sorting capabilities.
- * 
- * Jobs:
- * Job1: Build supplier lists
- * Job2: Calculate similarities with composite key for efficient top-K selection
+ * Task E (Scalable for LARGE dataset):
+ * For each company, find TOP-K (K=4) most similar companies (Jaccard over supplier sets)
+ * and output common suppliers list for those pairs, formatted like Part (B):
+ *   A:B, {C,E}, simscore
+ *
+
  */
 public class TaskE {
 
-    // ========== Composite Key for Secondary Sorting ==========
-    
-    public static class CompanySimilarityKey implements WritableComparable<CompanySimilarityKey> {
-        private String companyId;
-        private double similarity;
-        private String otherCompanyId;
-        
-        public CompanySimilarityKey() {}
-        
-        public CompanySimilarityKey(String companyId, double similarity, String otherCompanyId) {
-            this.companyId = companyId;
-            this.similarity = similarity;
-            this.otherCompanyId = otherCompanyId;
-        }
-        
-        @Override
-        public void write(DataOutput out) throws IOException {
-            out.writeUTF(companyId);
-            out.writeDouble(similarity);
-            out.writeUTF(otherCompanyId);
-        }
-        
-        @Override
-        public void readFields(DataInput in) throws IOException {
-            companyId = in.readUTF();
-            similarity = in.readDouble();
-            otherCompanyId = in.readUTF();
-        }
-        
-        @Override
-        public int compareTo(CompanySimilarityKey other) {
-            // First, group by company ID
-            int cmp = this.companyId.compareTo(other.companyId);
-            if (cmp != 0) return cmp;
-            
-            // Then sort by similarity (descending)
-            cmp = Double.compare(other.similarity, this.similarity);
-            if (cmp != 0) return cmp;
-            
-            // Finally, sort by other company ID (ascending) for tie-breaking
-            return this.otherCompanyId.compareTo(other.otherCompanyId);
-        }
-        
-        public String getCompanyId() { return companyId; }
-        public double getSimilarity() { return similarity; }
-        public String getOtherCompanyId() { return otherCompanyId; }
-    }
-    
-    // ========== Natural Key Grouping Comparator ==========
-    
-    public static class NaturalKeyGroupingComparator extends WritableComparator {
-        protected NaturalKeyGroupingComparator() {
-            super(CompanySimilarityKey.class, true);
-        }
-        
-        @Override
-        public int compare(WritableComparable w1, WritableComparable w2) {
-            CompanySimilarityKey k1 = (CompanySimilarityKey) w1;
-            CompanySimilarityKey k2 = (CompanySimilarityKey) w2;
-            return k1.getCompanyId().compareTo(k2.getCompanyId());
-        }
-    }
-    
-    // ========== Partitioner ==========
-    
-    public static class CompanyPartitioner extends Partitioner<CompanySimilarityKey, Text> {
-        @Override
-        public int getPartition(CompanySimilarityKey key, Text value, int numPartitions) {
-            return (key.getCompanyId().hashCode() & Integer.MAX_VALUE) % numPartitions;
-        }
+    // -------------------- Config --------------------
+    private static final int TOP_K = 4;
+
+    // Paths for intermediate outputs (suffixes)
+    private static final String OUT_JOB1 = "_job1_counts";
+    private static final String OUT_JOB2 = "_job2_pairs_by_supplier";
+    private static final String OUT_JOB3 = "_job3_pair_common_counts";
+    private static final String OUT_JOB4_TOPK = "_job4_topk";
+    private static final String OUT_JOB4_PAIRS = "_job4_selected_pairs";
+    private static final String OUT_JOB5_PAIR_SUP = "_job5_pair_suppliers_raw";
+    private static final String OUT_JOB6_PAIR_SUP_AGG = "_job6_pair_suppliers_agg";
+
+    // cache names
+    private static final String CACHE_COUNTS = "company_counts.tsv";
+    private static final String CACHE_SELECTED_PAIRS = "selected_pairs.tsv";
+
+    // -------------------- Utilities --------------------
+
+    /** Normalize pair (a,b) with a<b and encode into long key. */
+    private static long pairKey(long a, long b) {
+        long x = Math.min(a, b);
+        long y = Math.max(a, b);
+        return (x << 32) ^ (y & 0xffffffffL);
     }
 
-    // ========== Job 1: Build Supplier List ==========
-    
-    public static class SupplierListMapper extends Mapper<Object, Text, Text, Text> {
-        private Text buyer = new Text();
-        private Text supplier = new Text();
+    /** Decode pairKey to "a,b". */
+    private static String pairKeyToString(long key) {
+        long a = (key >>> 32);
+        long b = (key & 0xffffffffL);
+        // b might be negative if interpreted as signed int; fix:
+        b = b & 0xffffffffL;
+        return a + "," + b;
+    }
+
+    /** Parse "a,b" to pairKey. */
+    private static long parsePairKey(String s) {
+        String[] p = s.split(",");
+        long a = Long.parseLong(p[0].trim());
+        long b = Long.parseLong(p[1].trim());
+        return pairKey(a, b);
+    }
+
+    /** Load a small TSV file from local cache into map: company->count */
+    private static Map<Long, Integer> loadCountsFromLocalCache(File localFile) throws IOException {
+        Map<Long, Integer> map = new HashMap<>(200_000);
+        try (BufferedReader br = new BufferedReader(new FileReader(localFile))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                String[] parts = line.split("\\t");
+                if (parts.length < 2) continue;
+                long id = Long.parseLong(parts[0]);
+                int c = Integer.parseInt(parts[1]);
+                map.put(id, c);
+            }
+        }
+        return map;
+    }
+
+    /** Load selected pair keys from local cache into a HashSet<Long>. */
+    private static HashSet<Long> loadSelectedPairsFromLocalCache(File localFile) throws IOException {
+        HashSet<Long> set = new HashSet<>(600_000);
+        try (BufferedReader br = new BufferedReader(new FileReader(localFile))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                // accept "a,b" or "a\tb"
+                if (line.contains("\t")) {
+                    String[] parts = line.split("\\t");
+                    if (parts.length >= 2) {
+                        long a = Long.parseLong(parts[0]);
+                        long b = Long.parseLong(parts[1]);
+                        set.add(pairKey(a, b));
+                    }
+                } else {
+                    set.add(parsePairKey(line));
+                }
+            }
+        }
+        return set;
+    }
+
+    // -------------------- Job1: company supplierCount --------------------
+
+    public static class CountMapper extends Mapper<LongWritable, Text, LongWritable, LongWritable> {
+        private final LongWritable outK = new LongWritable();
+        private final LongWritable outV = new LongWritable();
 
         @Override
-        public void map(Object key, Text value, Context context) 
-                throws IOException, InterruptedException {
+        public void map(LongWritable key, Text value, Context ctx) throws IOException, InterruptedException {
             String line = value.toString().trim();
             if (line.isEmpty()) return;
-            
             String[] parts = line.split("\\s+");
-            if (parts.length >= 2) {
-                buyer.set(parts[0]);
-                supplier.set(parts[1]);
-                context.write(buyer, supplier);
-            }
+            if (parts.length < 2) return;
+            long buyer = Long.parseLong(parts[0]);
+            long supplier = Long.parseLong(parts[1]);
+            outK.set(buyer);
+            outV.set(supplier);
+            ctx.write(outK, outV);
         }
     }
 
-    public static class SupplierListReducer extends Reducer<Text, Text, Text, Text> {
+    public static class CountReducer extends Reducer<LongWritable, LongWritable, LongWritable, IntWritable> {
+        private final IntWritable outV = new IntWritable();
+
         @Override
-        public void reduce(Text key, Iterable<Text> values, Context context) 
+        public void reduce(LongWritable buyer, Iterable<LongWritable> suppliers, Context ctx)
                 throws IOException, InterruptedException {
-            Set<String> suppliers = new TreeSet<>();
-            for (Text val : values) {
-                suppliers.add(val.toString());
-            }
-            
-            if (!suppliers.isEmpty()) {
-                context.write(key, new Text(String.join(",", suppliers)));
-            }
+            // dedup suppliers per buyer
+            HashSet<Long> set = new HashSet<>();
+            for (LongWritable s : suppliers) set.add(s.get());
+            outV.set(set.size());
+            ctx.write(buyer, outV);
         }
     }
 
-    // ========== Job 2: Calculate Similarities with Composite Key ==========
-    
-    public static class SimilarityMapper extends Mapper<Object, Text, Text, Text> {
+    // -------------------- Job2: supplier -> buyers, emit pair -> 1 --------------------
+
+    public static class SupplierToBuyerMapper extends Mapper<LongWritable, Text, LongWritable, LongWritable> {
+        private final LongWritable outK = new LongWritable();
+        private final LongWritable outV = new LongWritable();
+
         @Override
-        public void map(Object key, Text value, Context context) 
-                throws IOException, InterruptedException {
+        public void map(LongWritable key, Text value, Context ctx) throws IOException, InterruptedException {
             String line = value.toString().trim();
             if (line.isEmpty()) return;
-            
+            String[] parts = line.split("\\s+");
+            if (parts.length < 2) return;
+            long buyer = Long.parseLong(parts[0]);
+            long supplier = Long.parseLong(parts[1]);
+            outK.set(supplier);
+            outV.set(buyer);
+            ctx.write(outK, outV);
+        }
+    }
+
+    public static class GeneratePairsReducer extends Reducer<LongWritable, LongWritable, LongWritable, IntWritable> {
+        private static final IntWritable ONE = new IntWritable(1);
+        private final LongWritable outK = new LongWritable();
+
+        @Override
+        public void reduce(LongWritable supplier, Iterable<LongWritable> buyers, Context ctx)
+                throws IOException, InterruptedException {
+            // dedup buyers per supplier
+            HashSet<Long> set = new HashSet<>();
+            for (LongWritable b : buyers) set.add(b.get());
+            if (set.size() < 2) return;
+
+            long[] arr = new long[set.size()];
+            int i = 0;
+            for (Long b : set) arr[i++] = b;
+            Arrays.sort(arr);
+
+            // emit all pairs (a<b) contributed by this supplier
+            for (int x = 0; x < arr.length; x++) {
+                for (int y = x + 1; y < arr.length; y++) {
+                    long pk = pairKey(arr[x], arr[y]);
+                    outK.set(pk);
+                    ctx.write(outK, ONE);
+                }
+            }
+        }
+    }
+
+    // -------------------- Job3: sum commonCount per pair --------------------
+
+    public static class PairCountMapper extends Mapper<LongWritable, Text, LongWritable, IntWritable> {
+        private final LongWritable outK = new LongWritable();
+        private final IntWritable outV = new IntWritable();
+
+        @Override
+        public void map(LongWritable key, Text value, Context ctx) throws IOException, InterruptedException {
+            String line = value.toString().trim();
+            if (line.isEmpty()) return;
+            // input is "pairKey\t1"
             String[] parts = line.split("\\t");
-            if (parts.length >= 2) {
-                context.write(new Text("ALL"), new Text(parts[0] + ":" + parts[1]));
-            }
+            if (parts.length < 2) return;
+            outK.set(Long.parseLong(parts[0]));
+            outV.set(Integer.parseInt(parts[1]));
+            ctx.write(outK, outV);
         }
     }
 
-    public static class SimilarityReducer extends Reducer<Text, Text, CompanySimilarityKey, Text> {
+    public static class SumIntReducer extends Reducer<LongWritable, IntWritable, LongWritable, IntWritable> {
+        private final IntWritable outV = new IntWritable();
+
         @Override
-        public void reduce(Text key, Iterable<Text> values, Context context) 
+        public void reduce(LongWritable pairKey, Iterable<IntWritable> vals, Context ctx)
                 throws IOException, InterruptedException {
-            
-            List<CompanySuppliers> companies = new ArrayList<>();
-            for (Text val : values) {
-                String[] parts = val.toString().split(":", 2);
-                if (parts.length == 2) {
-                    String companyId = parts[0];
-                    Set<String> suppliers = new HashSet<>(Arrays.asList(parts[1].split(",")));
-                    companies.add(new CompanySuppliers(companyId, suppliers));
-                }
-            }
-            
-            // Calculate similarity for all pairs
-            for (int i = 0; i < companies.size(); i++) {
-                for (int j = i + 1; j < companies.size(); j++) {
-                    CompanySuppliers c1 = companies.get(i);
-                    CompanySuppliers c2 = companies.get(j);
-                    
-                    Set<String> common = new HashSet<>(c1.suppliers);
-                    common.retainAll(c2.suppliers);
-                    
-                    Set<String> union = new HashSet<>(c1.suppliers);
-                    union.addAll(c2.suppliers);
-                    
-                    double similarity = 0.0;
-                    if (!union.isEmpty()) {
-                        similarity = (double) common.size() / union.size();
-                    }
-                    
-                    if (similarity > 0) {
-                        List<String> commonList = new ArrayList<>(common);
-                        Collections.sort(commonList);
-                        String commonStr = "{" + String.join(",", commonList) + "}";
-                        
-                        // Use composite key for sorting
-                        context.write(
-                            new CompanySimilarityKey(c1.companyId, similarity, c2.companyId),
-                            new Text(commonStr)
-                        );
-                        
-                        context.write(
-                            new CompanySimilarityKey(c2.companyId, similarity, c1.companyId),
-                            new Text(commonStr)
-                        );
-                    }
-                }
-            }
-        }
-        
-        private static class CompanySuppliers {
-            String companyId;
-            Set<String> suppliers;
-            
-            CompanySuppliers(String id, Set<String> sup) {
-                this.companyId = id;
-                this.suppliers = sup;
-            }
+            int sum = 0;
+            for (IntWritable v : vals) sum += v.get();
+            outV.set(sum);
+            ctx.write(pairKey, outV);
         }
     }
 
-    // ========== Job 3: Select Top K with Secondary Sorting ==========
-    
-    public static class TopKMapper extends Mapper<Object, Text, CompanySimilarityKey, Text> {
+    // -------------------- Job4: compute similarity + per-company TopK; output selected pairs --------------------
+
+    public static class SimilarityTopKMapper extends Mapper<LongWritable, Text, LongWritable, Text> {
+        private Map<Long, Integer> counts;
+        private final LongWritable outK = new LongWritable();
+        private final Text outV = new Text();
+
         @Override
-        public void map(Object key, Text value, Context context) 
-                throws IOException, InterruptedException {
+        protected void setup(Context ctx) throws IOException {
+            counts = new HashMap<>(200_000);
+
+            URI[] cacheFiles = ctx.getCacheFiles();
+            if (cacheFiles == null) throw new IOException("No cache file for company counts.");
+            File local = null;
+            for (URI u : cacheFiles) {
+                if (u.getPath().endsWith(CACHE_COUNTS)) {
+                    local = new File("./" + CACHE_COUNTS);
+                    break;
+                }
+            }
+            if (local == null || !local.exists()) {
+                // fallback: first cache file
+                local = new File("./" + new File(cacheFiles[0].getPath()).getName());
+            }
+            counts = loadCountsFromLocalCache(local);
+        }
+
+        @Override
+        public void map(LongWritable key, Text value, Context ctx) throws IOException, InterruptedException {
             String line = value.toString().trim();
             if (line.isEmpty()) return;
-            
-            // Parse the composite key output from previous job
-            // Format: companyId similarity otherCompanyId\tcommonSuppliers
-            String[] parts = line.split("\\s+");
-            if (parts.length >= 3) {
-                try {
-                    String companyId = parts[0];
-                    double similarity = Double.parseDouble(parts[1]);
-                    String otherCompanyId = parts[2];
-                    String commonSuppliers = parts.length > 3 ? parts[3] : "{}";
-                    
-                    CompanySimilarityKey compositeKey = new CompanySimilarityKey(
-                        companyId, similarity, otherCompanyId
-                    );
-                    context.write(compositeKey, new Text(commonSuppliers));
-                } catch (NumberFormatException e) {
-                    // Skip malformed lines
-                }
-            }
+            // input: "pairKey\tcommonCount"
+            String[] parts = line.split("\\t");
+            if (parts.length < 2) return;
+
+            long pk = Long.parseLong(parts[0]);
+            int common = Integer.parseInt(parts[1]);
+
+            long a = (pk >>> 32);
+            long b = (pk & 0xffffffffL) & 0xffffffffL;
+
+            Integer ca = counts.get(a);
+            Integer cb = counts.get(b);
+            if (ca == null || cb == null) return;
+
+            int denom = ca + cb - common;
+            if (denom <= 0) return;
+            double sim = (double) common / (double) denom;
+            if (sim <= 0.0) return;
+
+            // emit two directed records keyed by company
+            // value: other,sim,pairKey
+            outK.set(a);
+            outV.set(b + "," + sim + "," + pk);
+            ctx.write(outK, outV);
+
+            outK.set(b);
+            outV.set(a + "," + sim + "," + pk);
+            ctx.write(outK, outV);
         }
     }
-    
-    public static class TopKReducer extends Reducer<CompanySimilarityKey, Text, Text, Text> {
-        private int K = 4;
-        private String currentCompany = null;
-        private int count = 0;
-        
-        @Override
-        protected void setup(Context context) throws IOException, InterruptedException {
-            K = context.getConfiguration().getInt("topk.k", 4);
+
+    private static class Cand {
+        long other;
+        double sim;
+        long pairKey;
+
+        Cand(long other, double sim, long pairKey) {
+            this.other = other;
+            this.sim = sim;
+            this.pairKey = pairKey;
         }
-        
+    }
+
+    /** Comparator for min-heap: keep worst on top (lowest sim, and for tie larger other) */
+    private static final Comparator<Cand> WORST_FIRST = (c1, c2) -> {
+        int cmp = Double.compare(c1.sim, c2.sim); // ascending sim
+        if (cmp != 0) return cmp;
+        // for equal sim, we prefer smaller other in final, so worst is larger other
+        return Long.compare(c2.other, c1.other); // descending other => larger is "worse"
+    };
+
+    public static class TopKReducer extends Reducer<LongWritable, Text, Text, Text> {
+        private MultipleOutputs<Text, Text> mos;
+
         @Override
-        public void reduce(CompanySimilarityKey key, Iterable<Text> values, Context context) 
+        protected void setup(Context ctx) {
+            mos = new MultipleOutputs<>(ctx);
+        }
+
+        @Override
+        public void reduce(LongWritable company, Iterable<Text> vals, Context ctx)
                 throws IOException, InterruptedException {
-            
-            // Reset counter when we encounter a new company
-            if (currentCompany == null || !currentCompany.equals(key.getCompanyId())) {
-                currentCompany = key.getCompanyId();
-                count = 0;
+
+            PriorityQueue<Cand> pq = new PriorityQueue<>(TOP_K + 1, WORST_FIRST);
+
+            for (Text t : vals) {
+                String[] p = t.toString().split(",", 3);
+                if (p.length < 3) continue;
+                long other = Long.parseLong(p[0]);
+                double sim = Double.parseDouble(p[1]);
+                long pk = Long.parseLong(p[2]);
+
+                Cand c = new Cand(other, sim, pk);
+                pq.offer(c);
+                if (pq.size() > TOP_K) pq.poll();
             }
-            
-            // Only output top K
-            if (count < K) {
-                for (Text val : values) {
-                    String output = key.getCompanyId() + ":" + key.getOtherCompanyId() + 
-                                   ", " + val.toString() + ", " + 
-                                   String.format("%.6f", key.getSimilarity());
-                    context.write(new Text(output), new Text(""));
-                    count++;
-                    if (count >= K) break;
+
+            if (pq.isEmpty()) return;
+
+            // sort final by best first: higher sim, tie smaller other
+            ArrayList<Cand> list = new ArrayList<>(pq);
+            list.sort((c1, c2) -> {
+                int cmp = Double.compare(c2.sim, c1.sim); // descending sim
+                if (cmp != 0) return cmp;
+                return Long.compare(c1.other, c2.other);   // ascending other
+            });
+
+            long a = company.get();
+
+            for (Cand c : list) {
+                // topk output (directed)
+                // company \t other,sim,pairKey
+                mos.write("topk", new Text(Long.toString(a)),
+                        new Text(c.other + "," + c.sim + "," + c.pairKey));
+
+                // selected pairs output (normalized) as "a\tb"
+                long pk = c.pairKey;
+                long x = (pk >>> 32);
+                long y = (pk & 0xffffffffL) & 0xffffffffL;
+                mos.write("pairs", new Text(Long.toString(x)), new Text(Long.toString(y)));
+            }
+        }
+
+        @Override
+        protected void cleanup(Context ctx) throws IOException, InterruptedException {
+            mos.close();
+        }
+    }
+
+    // -------------------- Job5: for selected pairs only, compute (pair)->supplier occurrences --------------------
+
+    public static class SupplierToBuyerForSelectedMapper extends Mapper<LongWritable, Text, LongWritable, LongWritable> {
+        private final LongWritable outK = new LongWritable();
+        private final LongWritable outV = new LongWritable();
+
+        @Override
+        public void map(LongWritable key, Text value, Context ctx) throws IOException, InterruptedException {
+            String line = value.toString().trim();
+            if (line.isEmpty()) return;
+            String[] parts = line.split("\\s+");
+            if (parts.length < 2) return;
+            long buyer = Long.parseLong(parts[0]);
+            long supplier = Long.parseLong(parts[1]);
+            outK.set(supplier);
+            outV.set(buyer);
+            ctx.write(outK, outV);
+        }
+    }
+
+    public static class SelectedPairsSupplierReducer extends Reducer<LongWritable, LongWritable, Text, LongWritable> {
+        private HashSet<Long> selectedPairs;
+        private final Text outK = new Text();
+        private final LongWritable outV = new LongWritable();
+
+        @Override
+        protected void setup(Context ctx) throws IOException {
+            URI[] cacheFiles = ctx.getCacheFiles();
+            if (cacheFiles == null) throw new IOException("No cache file for selected pairs.");
+            File local = null;
+            for (URI u : cacheFiles) {
+                if (u.getPath().endsWith(CACHE_SELECTED_PAIRS)) {
+                    local = new File("./" + CACHE_SELECTED_PAIRS);
+                    break;
+                }
+            }
+            if (local == null || !local.exists()) {
+                local = new File("./" + new File(cacheFiles[0].getPath()).getName());
+            }
+            selectedPairs = loadSelectedPairsFromLocalCache(local);
+        }
+
+        @Override
+        public void reduce(LongWritable supplier, Iterable<LongWritable> buyers, Context ctx)
+                throws IOException, InterruptedException {
+
+            HashSet<Long> set = new HashSet<>();
+            for (LongWritable b : buyers) set.add(b.get());
+            if (set.size() < 2) return;
+
+            long[] arr = new long[set.size()];
+            int i = 0;
+            for (Long b : set) arr[i++] = b;
+            Arrays.sort(arr);
+
+            long sup = supplier.get();
+            outV.set(sup);
+
+            // enumerate buyer pairs, only emit if in selectedPairs
+            for (int x = 0; x < arr.length; x++) {
+                for (int y = x + 1; y < arr.length; y++) {
+                    long pk = pairKey(arr[x], arr[y]);
+                    if (selectedPairs.contains(pk)) {
+                        outK.set(pairKeyToString(pk)); // "a,b"
+                        ctx.write(outK, outV);         // pair -> supplier
+                    }
                 }
             }
         }
     }
 
-    // ========== Main Driver ==========
-    
+    // -------------------- Job6: aggregate suppliers per pair --------------------
+
+    public static class PairSupplierMapper extends Mapper<LongWritable, Text, Text, LongWritable> {
+        private final Text outK = new Text();
+        private final LongWritable outV = new LongWritable();
+
+        @Override
+        public void map(LongWritable key, Text value, Context ctx) throws IOException, InterruptedException {
+            String line = value.toString().trim();
+            if (line.isEmpty()) return;
+            // "a,b \t supplier"
+            String[] parts = line.split("\\t");
+            if (parts.length < 2) return;
+            outK.set(parts[0]);
+            outV.set(Long.parseLong(parts[1]));
+            ctx.write(outK, outV);
+        }
+    }
+
+    public static class PairSupplierAggReducer extends Reducer<Text, LongWritable, Text, Text> {
+        private final Text outV = new Text();
+
+        @Override
+        public void reduce(Text pair, Iterable<LongWritable> suppliers, Context ctx)
+                throws IOException, InterruptedException {
+
+            TreeSet<Long> set = new TreeSet<>();
+            for (LongWritable s : suppliers) set.add(s.get());
+            if (set.isEmpty()) return;
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("{");
+            boolean first = true;
+            for (Long s : set) {
+                if (!first) sb.append(",");
+                sb.append(s);
+                first = false;
+            }
+            sb.append("}");
+            outV.set(sb.toString());
+            ctx.write(pair, outV);
+        }
+    }
+
+    // -------------------- Job7: join TopK with supplier lists and output final lines --------------------
+
+    public static class TopKJoinMapper extends Mapper<LongWritable, Text, Text, Text> {
+        private final Text outK = new Text();
+        private final Text outV = new Text();
+
+        @Override
+        public void map(LongWritable key, Text value, Context ctx) throws IOException, InterruptedException {
+            // topk output: company \t other,sim,pairKey
+            String line = value.toString().trim();
+            if (line.isEmpty()) return;
+            String[] parts = line.split("\\t");
+            if (parts.length < 2) return;
+
+            long company = Long.parseLong(parts[0]);
+            String[] p2 = parts[1].split(",", 3);
+            if (p2.length < 3) return;
+            long other = Long.parseLong(p2[0]);
+            double sim = Double.parseDouble(p2[1]);
+            long pk = Long.parseLong(p2[2]);
+
+            String pairStr = pairKeyToString(pk); // normalized "a,b"
+            outK.set(pairStr);
+            // store directed top record
+            outV.set("TOP:" + company + ":" + other + ":" + sim);
+            ctx.write(outK, outV);
+        }
+    }
+
+    public static class PairSupJoinMapper extends Mapper<LongWritable, Text, Text, Text> {
+        private final Text outK = new Text();
+        private final Text outV = new Text();
+
+        @Override
+        public void map(LongWritable key, Text value, Context ctx) throws IOException, InterruptedException {
+            // pairSupAgg: "a,b \t {s1,s2}"
+            String line = value.toString().trim();
+            if (line.isEmpty()) return;
+            String[] parts = line.split("\\t");
+            if (parts.length < 2) return;
+            outK.set(parts[0]);
+            outV.set("SUP:" + parts[1]);
+            ctx.write(outK, outV);
+        }
+    }
+
+    public static class FinalJoinReducer extends Reducer<Text, Text, Text, NullWritable> {
+        @Override
+        public void reduce(Text pair, Iterable<Text> vals, Context ctx)
+                throws IOException, InterruptedException {
+            String supList = "{}";
+            List<String> tops = new ArrayList<>(4);
+
+            for (Text t : vals) {
+                String s = t.toString();
+                if (s.startsWith("SUP:")) supList = s.substring(4);
+                else if (s.startsWith("TOP:")) tops.add(s.substring(4));
+            }
+
+            if (tops.isEmpty()) return;
+
+            for (String rec : tops) {
+                // rec: company:other:sim
+                String[] p = rec.split(":");
+                if (p.length < 3) continue;
+                String company = p[0];
+                String other = p[1];
+                String sim = p[2];
+
+                // format: A:B, {C,E}, simscore
+                String outLine = company + ":" + other + ", " + supList + ", " + sim;
+                ctx.write(new Text(outLine), NullWritable.get());
+            }
+        }
+    }
+
+    // -------------------- Driver --------------------
+
     public static void main(String[] args) throws Exception {
-        if (args.length < 2 || args.length > 3) {
-            System.err.println("Usage: TaskE <input path> <output path> [K]");
-            System.exit(-1);
+        Configuration conf = new Configuration();
+        String[] otherArgs = new GenericOptionsParser(conf, args).getRemainingArgs();
+
+        if (otherArgs.length != 2) {
+            System.err.println("Usage: TaskE <large_relation_input> <output_path>");
+            System.exit(2);
         }
 
-        Configuration conf = new Configuration();
-        int K = 4;
-        if (args.length == 3) {
-            K = Integer.parseInt(args[2]);
-        }
-        conf.setInt("topk.k", K);
-        
-        // Enable compression for large dataset
-        conf.setBoolean("mapreduce.map.output.compress", true);
-        conf.set("mapreduce.map.output.compress.codec", "org.apache.hadoop.io.compress.SnappyCodec");
-        
-        // Job 1: Build supplier lists
-        Job job1 = Job.getInstance(conf, "Build Supplier Lists");
+        String input = otherArgs[0];
+        String outBase = otherArgs[1];
+
+        Path job1Out = new Path(outBase + OUT_JOB1);
+        Path job2Out = new Path(outBase + OUT_JOB2);
+        Path job3Out = new Path(outBase + OUT_JOB3);
+        Path job4TopOut = new Path(outBase + OUT_JOB4_TOPK);
+        Path job4PairsOut = new Path(outBase + OUT_JOB4_PAIRS);
+        Path job5Out = new Path(outBase + OUT_JOB5_PAIR_SUP);
+        Path job6Out = new Path(outBase + OUT_JOB6_PAIR_SUP_AGG);
+        Path finalOut = new Path(outBase);
+
+        // clean outputs if exist
+        FileSystem fs = FileSystem.get(conf);
+        fs.delete(job1Out, true);
+        fs.delete(job2Out, true);
+        fs.delete(job3Out, true);
+        fs.delete(job4TopOut, true);
+        fs.delete(job4PairsOut, true);
+        fs.delete(job5Out, true);
+        fs.delete(job6Out, true);
+        fs.delete(finalOut, true);
+
+        // ---------------- Job1: company supplierCount ----------------
+        Job job1 = Job.getInstance(conf, "TaskE-Job1-CompanySupplierCount");
         job1.setJarByClass(TaskE.class);
-        job1.setMapperClass(SupplierListMapper.class);
-        job1.setReducerClass(SupplierListReducer.class);
-        job1.setOutputKeyClass(Text.class);
-        job1.setOutputValueClass(Text.class);
-        
-        FileInputFormat.addInputPath(job1, new Path(args[0]));
-        Path job1Output = new Path(args[1] + "_job1");
-        FileOutputFormat.setOutputPath(job1, job1Output);
-        
-        if (!job1.waitForCompletion(true)) {
-            System.exit(1);
-        }
-        
-        // Job 2: Calculate similarity with composite keys
-        Job job2 = Job.getInstance(conf, "Calculate Similarities");
+        job1.setMapperClass(CountMapper.class);
+        job1.setReducerClass(CountReducer.class);
+        job1.setMapOutputKeyClass(LongWritable.class);
+        job1.setMapOutputValueClass(LongWritable.class);
+        job1.setOutputKeyClass(LongWritable.class);
+        job1.setOutputValueClass(IntWritable.class);
+        job1.setNumReduceTasks(16);
+        TextInputFormat.addInputPath(job1, new Path(input));
+        FileOutputFormat.setOutputPath(job1, job1Out);
+        if (!job1.waitForCompletion(true)) System.exit(1);
+
+        // ---------------- Job2: supplier->buyers -> pair->1 ----------------
+        Job job2 = Job.getInstance(conf, "TaskE-Job2-GeneratePairsBySupplier");
         job2.setJarByClass(TaskE.class);
-        job2.setMapperClass(SimilarityMapper.class);
-        job2.setReducerClass(SimilarityReducer.class);
-        job2.setMapOutputKeyClass(Text.class);
-        job2.setMapOutputValueClass(Text.class);
-        job2.setOutputKeyClass(CompanySimilarityKey.class);
-        job2.setOutputValueClass(Text.class);
-        job2.setNumReduceTasks(1);
-        
-        FileInputFormat.addInputPath(job2, job1Output);
-        Path job2Output = new Path(args[1] + "_job2");
-        FileOutputFormat.setOutputPath(job2, job2Output);
-        
-        if (!job2.waitForCompletion(true)) {
-            System.exit(1);
-        }
-        
-        // Job 3: Select top K with secondary sorting
-        Job job3 = Job.getInstance(conf, "Select Top K with Secondary Sorting");
+        job2.setMapperClass(SupplierToBuyerMapper.class);
+        job2.setReducerClass(GeneratePairsReducer.class);
+        job2.setMapOutputKeyClass(LongWritable.class);
+        job2.setMapOutputValueClass(LongWritable.class);
+        job2.setOutputKeyClass(LongWritable.class);
+        job2.setOutputValueClass(IntWritable.class);
+        job2.setNumReduceTasks(32);
+        TextInputFormat.addInputPath(job2, new Path(input));
+        FileOutputFormat.setOutputPath(job2, job2Out);
+        if (!job2.waitForCompletion(true)) System.exit(1);
+
+        // ---------------- Job3: sum common counts ----------------
+        Job job3 = Job.getInstance(conf, "TaskE-Job3-SumCommonCounts");
         job3.setJarByClass(TaskE.class);
-        job3.setMapperClass(TopKMapper.class);
-        job3.setReducerClass(TopKReducer.class);
-        
-        job3.setMapOutputKeyClass(CompanySimilarityKey.class);
-        job3.setMapOutputValueClass(Text.class);
-        job3.setOutputKeyClass(Text.class);
-        job3.setOutputValueClass(Text.class);
-        
-        // Set partitioner and grouping comparator for secondary sorting
-        job3.setPartitionerClass(CompanyPartitioner.class);
-        job3.setGroupingComparatorClass(NaturalKeyGroupingComparator.class);
-        
-        FileInputFormat.addInputPath(job3, job2Output);
-        FileOutputFormat.setOutputPath(job3, new Path(args[1]));
-        
-        System.exit(job3.waitForCompletion(true) ? 0 : 1);
+        job3.setMapperClass(PairCountMapper.class);
+        job3.setCombinerClass(SumIntReducer.class);
+        job3.setReducerClass(SumIntReducer.class);
+        job3.setMapOutputKeyClass(LongWritable.class);
+        job3.setMapOutputValueClass(IntWritable.class);
+        job3.setOutputKeyClass(LongWritable.class);
+        job3.setOutputValueClass(IntWritable.class);
+        job3.setNumReduceTasks(32);
+        TextInputFormat.addInputPath(job3, job2Out);
+        FileOutputFormat.setOutputPath(job3, job3Out);
+        if (!job3.waitForCompletion(true)) System.exit(1);
+
+        // ---------------- Job4: similarity + TopK; output selected pairs ----------------
+        Job job4 = Job.getInstance(conf, "TaskE-Job4-TopKSimilarity");
+        job4.setJarByClass(TaskE.class);
+
+        // add cache file (company counts) - rename to fixed local name
+        // use the first part file(s); easiest: add the whole directory via glob is not supported,
+        // so we copy merged counts to a single file.
+        Path mergedCounts = new Path(outBase + "_cache_company_counts.tsv");
+        fs.delete(mergedCounts, true);
+        mergeToSingleFile(fs, job1Out, mergedCounts);
+
+        job4.addCacheFile(new URI(mergedCounts.toString() + "#" + CACHE_COUNTS));
+
+        job4.setMapperClass(SimilarityTopKMapper.class);
+        job4.setReducerClass(TopKReducer.class);
+        job4.setMapOutputKeyClass(LongWritable.class);
+        job4.setMapOutputValueClass(Text.class);
+        job4.setOutputKeyClass(Text.class);
+        job4.setOutputValueClass(Text.class);
+        job4.setNumReduceTasks(32);
+
+        MultipleOutputs.addNamedOutput(job4, "topk", TextOutputFormat.class, Text.class, Text.class);
+        MultipleOutputs.addNamedOutput(job4, "pairs", TextOutputFormat.class, Text.class, Text.class);
+
+        TextInputFormat.addInputPath(job4, job3Out);
+        FileOutputFormat.setOutputPath(job4, new Path(outBase + "_job4_tmp"));
+        if (!job4.waitForCompletion(true)) System.exit(1);
+
+        // Move MultipleOutputs results to stable paths
+        moveNamedOutput(fs, new Path(outBase + "_job4_tmp"), "topk", job4TopOut);
+        moveNamedOutput(fs, new Path(outBase + "_job4_tmp"), "pairs", job4PairsOut);
+        fs.delete(new Path(outBase + "_job4_tmp"), true);
+
+        // ---------------- Job5: compute pair->supplier only for selected pairs ----------------
+        Job job5 = Job.getInstance(conf, "TaskE-Job5-SelectedPairsCommonSuppliers");
+        job5.setJarByClass(TaskE.class);
+
+        Path mergedPairs = new Path(outBase + "_cache_selected_pairs.tsv");
+        fs.delete(mergedPairs, true);
+        mergeToSingleFile(fs, job4PairsOut, mergedPairs);
+
+        job5.addCacheFile(new URI(mergedPairs.toString() + "#" + CACHE_SELECTED_PAIRS));
+
+        job5.setMapperClass(SupplierToBuyerForSelectedMapper.class);
+        job5.setReducerClass(SelectedPairsSupplierReducer.class);
+        job5.setMapOutputKeyClass(LongWritable.class);
+        job5.setMapOutputValueClass(LongWritable.class);
+        job5.setOutputKeyClass(Text.class);
+        job5.setOutputValueClass(LongWritable.class);
+        job5.setNumReduceTasks(32);
+
+        TextInputFormat.addInputPath(job5, new Path(input));
+        FileOutputFormat.setOutputPath(job5, job5Out);
+        if (!job5.waitForCompletion(true)) System.exit(1);
+
+        // ---------------- Job6: aggregate suppliers list per pair ----------------
+        Job job6 = Job.getInstance(conf, "TaskE-Job6-AggregatePairSuppliers");
+        job6.setJarByClass(TaskE.class);
+        job6.setMapperClass(PairSupplierMapper.class);
+        job6.setReducerClass(PairSupplierAggReducer.class);
+        job6.setMapOutputKeyClass(Text.class);
+        job6.setMapOutputValueClass(LongWritable.class);
+        job6.setOutputKeyClass(Text.class);
+        job6.setOutputValueClass(Text.class);
+        job6.setNumReduceTasks(16);
+
+        TextInputFormat.addInputPath(job6, job5Out);
+        FileOutputFormat.setOutputPath(job6, job6Out);
+        if (!job6.waitForCompletion(true)) System.exit(1);
+
+        // ---------------- Job7: join topk with supplier lists and output final lines ----------------
+        Job job7 = Job.getInstance(conf, "TaskE-Job7-FinalJoinAndFormat");
+        job7.setJarByClass(TaskE.class);
+
+        MultipleInputs.addInputPath(job7, job4TopOut, TextInputFormat.class, TopKJoinMapper.class);
+        MultipleInputs.addInputPath(job7, job6Out, TextInputFormat.class, PairSupJoinMapper.class);
+
+        job7.setReducerClass(FinalJoinReducer.class);
+        job7.setMapOutputKeyClass(Text.class);
+        job7.setMapOutputValueClass(Text.class);
+        job7.setOutputKeyClass(Text.class);
+        job7.setOutputValueClass(NullWritable.class);
+        job7.setNumReduceTasks(16);
+
+        FileOutputFormat.setOutputPath(job7, finalOut);
+        System.exit(job7.waitForCompletion(true) ? 0 : 1);
+    }
+
+    // -------------------- Helper: merge part files to single cache file --------------------
+
+    private static void mergeToSingleFile(FileSystem fs, Path dir, Path outFile) throws IOException {
+        // concatenate all part-* into one file in HDFS (simple and OK for ~100k-400k lines)
+        FSDataOutputStream out = fs.create(outFile, true);
+        try {
+            FileStatus[] files = fs.listStatus(dir, path -> path.getName().startsWith("part-"));
+            Arrays.sort(files, Comparator.comparing(f -> f.getPath().getName()));
+            byte[] buf = new byte[1 << 20];
+            for (FileStatus f : files) {
+                try (FSDataInputStream in = fs.open(f.getPath())) {
+                    int r;
+                    while ((r = in.read(buf)) > 0) out.write(buf, 0, r);
+                }
+            }
+        } finally {
+            out.close();
+        }
+    }
+
+    private static void moveNamedOutput(FileSystem fs, Path tmpDir, String named, Path targetDir) throws IOException {
+        fs.delete(targetDir, true);
+        fs.mkdirs(targetDir);
+
+        // named outputs are usually like: <tmpDir>/<named>-m-00000 or <named>-r-00000
+        FileStatus[] files = fs.listStatus(tmpDir, path -> path.getName().startsWith(named + "-"));
+        for (FileStatus f : files) {
+            Path dst = new Path(targetDir, "part-" + f.getPath().getName()); // keep distinct
+            fs.rename(f.getPath(), dst);
+        }
     }
 }
+
